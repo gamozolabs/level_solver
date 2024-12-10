@@ -3,14 +3,13 @@
 mod color;
 
 use std::f64::consts::*;
-use std::time::Instant;
 use std::sync::{Arc, Mutex};
-use ::rand::Rng;
+use ::rand::prelude::*;
 use macroquad::prelude::*;
 
 /// Extra Z-scale multiplication for rendering only. This is to visually
 /// amplify the Z axis.
-const Z_SCALE: f64 = 2000.;
+const Z_SCALE: f64 = 4000.;
 
 /// A renderer which can cache mesh allocations
 struct Renderer {
@@ -46,6 +45,7 @@ impl Renderer {
     /// This assumes the internal mesh is just a list of CCW triangles.
     /// Internally we'll generate `[0..num_verts]` for indices, and compute
     /// normals for the shading of the triangles.
+    #[allow(dead_code)]
     fn draw_int(&mut self) {
         // Convenience bindings
         let vertices = &mut self.mesh.vertices;
@@ -86,14 +86,51 @@ impl Renderer {
         draw_mesh(&self.mesh);
     }
 
+    /// Get the color for a given normalized value [0.0, 1.0]
+    fn color(val: f64) -> Color {
+        // Inferno color palette lookup
+        let idx = (val * 254.99) as usize;
+        let partial = (val * 254.99) - idx as f64;
+        let col1 = DVec3::from_array(color::INFERNO[idx + 0]);
+        let col2 = DVec3::from_array(color::INFERNO[idx + 1]);
+        let col = col1 * (1. - partial) + col2 * partial;
+        Color::new(col[0] as f32, col[1] as f32, col[2] as f32, 1.)
+    }
+
+    fn draw_square(&mut self, center: DVec3, size: f64, color: Color) {
+        // Create two triangles and draw them as a square
+        let bl = center + dvec3(-size / 2., -size / 2., 0.);
+        let br = center + dvec3( size / 2., -size / 2., 0.);
+        let tl = center + dvec3(-size / 2.,  size / 2., 0.);
+        let tr = center + dvec3( size / 2.,  size / 2., 0.);
+
+        // Generate both CCW triangles
+        for vert in [bl, tr, tl, bl, br, tr] {
+            self.mesh.vertices.push(Vertex::new(
+                vert.x as f32, vert.y as f32, vert.z as f32, 0., 0., color));
+        }
+
+        if self.mesh.vertices.len() >= 4096 {
+            self.flush();
+        }
+    }
+
+    fn flush(&mut self) {
+        if self.mesh.vertices.len() > 0 {
+            self.draw_int();
+            self.mesh.vertices.clear();
+        }
+    }
+
     /// Generate random samples for `measurements`
-    fn generate_samples(&mut self, measurements: &[Measurement]) {
+    fn generate_samples(&mut self, measurements: &[Measurement],
+            samples: usize) {
         // Generate the random samples
         if self.samples.len() == 0 {
             // Randomly sample all triangles
             for meas in measurements {
                 for tri in &meas.contact {
-                    for pos in tri.sample(100) {
+                    for pos in tri.sample(samples) {
                         self.samples.push((pos, Vec::new(), f64::MAX));
                     }
                 }
@@ -109,6 +146,9 @@ impl Renderer {
                     }
                 }
             }
+
+            // Randomize sample ordering
+            self.samples.shuffle(&mut ::rand::thread_rng());
         }
 
         // Reset sample points to max
@@ -121,7 +161,52 @@ impl Renderer {
                 *val = val.min(measurements[*meas_id].plane.get(*point).z);
             }
         }
+    }
 
+    /// Finds the average plane through all the points and normalizes all
+    /// the data to this plane
+    fn simplify(&mut self) {
+        // Generate matrix from data
+        let mut data = nalgebra::DMatrix::zeros(self.samples.len(), 3);
+        for (ii, (pt, _, z)) in self.samples.iter().enumerate() {
+            data[(ii, 0)] = pt.x;
+            data[(ii, 1)] = pt.y;
+            data[(ii, 2)] = *z;
+        }
+
+        // Compute centroid
+        let centroid = data.row_mean();
+
+        // Subtract centroid
+        data.row_iter_mut().for_each(|mut x| x -= &centroid);
+
+        // Compute SVD
+        let svd = data.svd(false, true);
+        let left = svd.v_t.unwrap();
+
+        // Get the right least singular value
+        let normal = left.row_iter().last().unwrap();
+
+        // Create the best fitting plane through the data
+        let plane = Plane {
+            normal: dvec3(normal[0], normal[1], normal[2]),
+            offset: 0.,
+        };
+
+        // Adjust all data to this plane
+        let mut min = std::f64::MAX;
+        for (loc, _, z) in self.samples.iter_mut() {
+            *z -= plane.get(*loc).z;
+            min = min.min(*z);
+        }
+
+        // Adjust all data to zero
+        for (_, _, z) in self.samples.iter_mut() {
+            *z -= min;
+        }
+    }
+
+    fn draw(&mut self) {
         // Find the extents of the data
         self.min_z = f64::MAX;
         self.max_z = f64::MIN;
@@ -129,51 +214,40 @@ impl Renderer {
             self.min_z = self.min_z.min(*z);
             self.max_z = self.max_z.max(*z);
         }
-    }
 
-    fn draw(&mut self, color: Color, measurements: &[Measurement]) {
-        // Take random samples
-        self.generate_samples(measurements);
         let range_z = self.max_z - self.min_z;
 
         // Display the data
-        for (loc, _, sample) in self.samples.iter_mut() {
+        let mut samples = Vec::new();
+        std::mem::swap(&mut self.samples, &mut samples);
+        for (loc, _, sample) in samples.iter() {
             let pct = (*sample - self.min_z) / range_z;
-
-            // Inferno color palette lookup
-            let idx = (pct * 254.99) as usize;
-            let partial = (pct * 254.99) - idx as f64;
-            let col1 = DVec3::from_array(color::INFERNO[idx + 0]);
-            let col2 = DVec3::from_array(color::INFERNO[idx + 1]);
-            let col = col1 * (1. - partial) + col2 * partial;
-            let col = Color::new(col[0] as f32, col[1] as f32, col[2] as f32, 1.);
-
-            draw_sphere(loc.extend(*sample * Z_SCALE).as_vec3(), 1., None, col);
+            let col = Self::color(pct);
+            self.draw_square(loc.extend(*sample), 1., col);
         }
-    }
-}
+        std::mem::swap(&mut self.samples, &mut samples);
 
-/// A surface which is generated from a set of measurements
-struct Surface {
-    measurements: Vec<Measurement>,
+        // Flush any pending triangles
+        self.flush();
+    }
 }
 
 /// A 2d triangle ABC
 #[derive(Clone, Copy)]
-struct Triangle {
-    a: DVec2,
-    b: DVec2,
-    c: DVec2,
+pub struct Triangle {
+    pub a: DVec2,
+    pub b: DVec2,
+    pub c: DVec2,
 }
 
 impl Triangle {
     /// Get the triangle ABC in an array representation
-    fn array(&self) -> [DVec2; 3] {
+    pub fn array(&self) -> [DVec2; 3] {
         [self.a, self.b, self.c]
     }
 
     /// Check if the triangle contains a given point
-    fn contains(&self, point: DVec2) -> bool {
+    pub fn contains(&self, point: DVec2) -> bool {
         fn sign(p1: DVec2, p2: DVec2, p3: DVec2) -> f64 {
             (p1.x - p3.x) * (p2.y - p3.y) - (p2.x - p3.x) * (p1.y - p3.y)
         }
@@ -189,7 +263,7 @@ impl Triangle {
     }
 
     /// Randomly sample exactly `points` from the triangle
-    fn sample(&self, points: usize) -> Vec<DVec2> {
+    pub fn sample(&self, points: usize) -> Vec<DVec2> {
         // Get the RNG
         let mut rng = ::rand::thread_rng();
 
@@ -210,7 +284,7 @@ impl Triangle {
     }
 
     /// Create a rectangle out of triangles
-    fn rectangle(bottom_left: DVec2, top_right: DVec2) -> Vec<Self> {
+    pub fn rectangle(bottom_left: DVec2, top_right: DVec2) -> Vec<Self> {
         // Compute all 4 corners of the rectangle
         let bl = bottom_left;
         let br = dvec2(top_right.x, bottom_left.y);
@@ -224,7 +298,7 @@ impl Triangle {
     }
 
     /// Create a polygon out of triangles with a given amount of sides
-    fn polygon(center: DVec2, radius: f64, sides: usize) -> Vec<Self> {
+    pub fn polygon(center: DVec2, radius: f64, sides: usize) -> Vec<Self> {
         // Compute the angle of a side
         let step = TAU / sides as f64;
 
@@ -277,7 +351,7 @@ impl Plane {
 
 /// Different bounds a value can have
 #[derive(Clone, Copy)]
-enum Bounds {
+pub enum Bounds {
     /// An exact value
     Constant(f64),
 
@@ -534,18 +608,6 @@ async fn main() {
         });
     }
 
-    // Compute overall center of mass for the entire surface
-    let mut total_com = dvec2(0., 0.);
-    for meas in measurements.iter_mut() {
-        total_com += meas.center_of_mass();
-    }
-    total_com /= measurements.len() as f64;
-
-    // Perform initial setting of parameters
-    for meas in measurements.iter_mut() {
-        meas.mutate();
-    }
-
     // Compute overlapping rectangles
     let mut overlaps = Vec::new();
     for m1 in 0..measurements.len() {
@@ -585,36 +647,38 @@ async fn main() {
 
         /// Number of iterations
         iters: u64,
-
-        version: u64,
     }
 
     // Save the current state
-    let state = Arc::new(Mutex::new(State {
-        best_planes:
-            measurements.iter().map(|x| x.plane).collect::<Vec<Plane>>(),
-        best: f64::MAX,
-        iters: 0,
-        version: 0,
-    }));
+    let state: [Arc<Mutex<State>>; 8] = std::array::from_fn(|_| {
+        Arc::new(Mutex::new(State {
+            best_planes: measurements.iter_mut().map(|x| {
+                // Randomize the measurement
+                x.mutate();
 
-    for _ in 0..8 {
+                // Return the plane
+                x.plane
+            }).collect::<Vec<Plane>>(),
+            best: f64::MAX,
+            iters: 0,
+        }))
+    });
+
+    for state in state.iter() {
         let mut measurements = measurements.clone();
         let state = state.clone();
         let overlaps = overlaps.clone();
 
         std::thread::spawn(move || {
             loop {
-                let version = {
+                {
                     let mut state = state.lock().unwrap();
 
                     // Restore best parameters
                     measurements.iter_mut().enumerate()
                         .for_each(|(ii, x)| x.plane = state.best_planes[ii]);
                     state.iters += 1;
-
-                    state.version
-                };
+                }
 
                 // Randomly mutate some measurements
                 for _ in 0..::rand::random::<usize>() % 4 + 1 {
@@ -638,7 +702,7 @@ async fn main() {
                 {
                     let mut state = state.lock().unwrap();
 
-                    if state.version == version && avg_dist < state.best {
+                    if avg_dist < state.best {
                         state.best_planes.iter_mut().enumerate()
                             .for_each(|(ii, x)| *x = measurements[ii].plane);
 
@@ -650,61 +714,38 @@ async fn main() {
     }
 
     let mut renderer = Renderer::default();
-    let it = Instant::now();
-    let mut winners = Vec::new();
-    let mut timeout = Instant::now();
-    loop {
+    let it = std::time::Instant::now();
+    for frame in 1u64.. {
+        use std::fmt::Write;
+
         // Render the best measurements we've had so far
         clear_background(DARKGRAY);
 
-        let best = {
-            let mut state = state.lock().unwrap();
+        let mut msg = String::new();
+        let mut range = (0., 0.);
+        for state in state.iter() {
+            let score = {
+                let state = state.lock().unwrap();
 
-            // Restore best parameters
-            measurements.iter_mut().enumerate()
-                .for_each(|(ii, x)| x.plane = state.best_planes[ii]);
+                // Restore best parameters
+                measurements.iter_mut().enumerate()
+                    .for_each(|(ii, x)| x.plane = state.best_planes[ii]);
 
-            let to = timeout.elapsed().as_secs_f64() >= 30.;
+                state.best
+            };
 
-            if to || state.best < 0.00165 {
-                if !to {
-                    winners.push((Color::new(::rand::random(), ::rand::random(), ::rand::random(), 1.0), state.best, measurements.clone()));
-                }
+            // Update samples
+            renderer.generate_samples(&measurements, 100);
+            renderer.simplify();
 
-                timeout = Instant::now();
-
-                // Perform initial setting of parameters
-                for meas in measurements.iter_mut() {
-                    meas.mutate();
-                }
-
-                *state = State {
-                    best_planes:
-                        measurements.iter().map(|x| x.plane).collect::<Vec<Plane>>(),
-                    best: f64::MAX,
-                    iters: 0,
-                    version: state.version + 1,
-                };
-            }
-
-            state.best
-        };
-
-        for (color, score, measurements) in winners.iter().chain(std::iter::once(&(BLUE, best, measurements.clone()))) {
+            // Average the data
             let mut sum = dvec3(0., 0., 0.);
             let mut cnt = 0.;
-            for meas in measurements {
-                for triangle in &meas.contact {
-                    for vertex in triangle.array() {
-                        sum += meas.plane.get(vertex);
-                        cnt += 1.;
-                    }
-                }
+            for pt in renderer.samples.iter().map(|(pt, _, z)| pt.extend(*z)) {
+                sum += pt;
+                cnt += 1.;
             }
             let avg = sum / cnt;
-
-            println!("Best {:10.6} | CoM {:10.3} {:10.3} {:10.3}",
-                score, avg.x, avg.y, avg.z);
 
             // Camera target is the center of mass
             let target = vec3(avg.x as f32, avg.y as f32, (avg.z * Z_SCALE) as f32);
@@ -716,9 +757,32 @@ async fn main() {
                 ..Default::default()
             });
 
-            renderer.draw(*color, measurements);
+            renderer.draw();
+
+            writeln!(&mut msg, "Score {:7.3} um err/point | Range {:7.3} um",
+                score * 1e3,
+                (renderer.max_z - renderer.min_z) * 1e3).unwrap();
+            range = (renderer.min_z, renderer.max_z - renderer.min_z);
         }
-        println!();
+
+        writeln!(&mut msg,
+            "FPS: {}", frame as f64 / it.elapsed().as_secs_f64()).unwrap();
+
+        set_default_camera();
+        draw_multiline_text(&msg, 0., 80., 24., Some(1.), BLACK);
+
+        let width = screen_width() as usize;
+
+        draw_rectangle(0., 5., width as f32, 30., BLACK);
+
+        for pixel in 0..width {
+            let normal = pixel as f64 / width as f64;
+            draw_rectangle(pixel as f32, 10., 1., 20., Renderer::color(normal));
+
+            if pixel % 100 == 0 {
+                draw_text(&format!("{:.2} um", (normal * range.1 + range.0) * 1e3), pixel as f32, 50., 18., Renderer::color(normal));
+            }
+        }
 
         next_frame().await;
     }

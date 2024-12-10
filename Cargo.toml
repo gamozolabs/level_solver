@@ -5,4 +5,5 @@ edition = "2024"
 
 [dependencies]
 macroquad = "0.4.13"
+nalgebra = "0.33.2"
 rand = "0.8.5"
