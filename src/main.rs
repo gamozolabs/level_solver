@@ -650,7 +650,7 @@ async fn main() {
     }
 
     // Save the current state
-    let state: [Arc<Mutex<State>>; 8] = std::array::from_fn(|_| {
+    let state: [Arc<Mutex<State>>; 1] = std::array::from_fn(|_| {
         Arc::new(Mutex::new(State {
             best_planes: measurements.iter_mut().map(|x| {
                 // Randomize the measurement
