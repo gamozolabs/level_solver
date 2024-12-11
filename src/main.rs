@@ -9,7 +9,7 @@ use macroquad::prelude::*;
 
 /// Extra Z-scale multiplication for rendering only. This is to visually
 /// amplify the Z axis.
-const Z_SCALE: f64 = 4000.;
+const Z_SCALE: f64 = 40000.;
 
 /// A renderer which can cache mesh allocations
 struct Renderer {
@@ -487,98 +487,166 @@ fn window_conf() -> Conf {
     }
 }
 
+/// Surface plate measurements 2024-12-10, quick 30 minute sampling at 50mm
+/// steps before NYC flight
+fn surface_plate(measurements: &mut Vec<Measurement>) {
+    // Surface plate layout
+    //
+    // |     613 mm     |
+    // +----------------+ -
+    // |                |
+    // |                | 459 mm
+    // |                |
+    // +----------------+ -
+    //
+    // There are 3mm margins on the plate (the above dimensions have 3mm of
+    // taper on all edges, thus the actual flat part of the plate removes 3mm
+    // on each side)
+    //
+    // The data is sampled with the 2d level at 50mm increments starting from
+    // the bottom left, going left to right, bottom to top
+    //
+    // The 2d level base is set at 150mm on X and Y. With 23.91mm diameter
+    // round feet.
+    //
+    // The 50mm x 50mm grid is made with a 600mm ruler centered on the plate.
+    // this adds another 3.5mm of margins on the flat part of the plate
+    //
+    // Readings are in mm/m. Positive readings are a raised "right/top" side.
+    let data = &[
+        (0.010, -0.140), (0.008, -0.145), (0.008, -0.150), (0.007, -0.154),
+        (0.003, -0.157), (0.001, -0.160), (-0.001, -0.162), (-0.003, -0.162),
+
+        (0.005, -0.141), (0.005, -0.145), (0.004, -0.148), (0.003, -0.151),
+        (0.001, -0.153), (0.001, -0.155), (0.000, -0.158), (0.000, -0.158),
+
+        /*(-0.010, -0.157), Extra data point off grid */ 
+
+        (0.000, -0.143), (0.001, -0.143), (0.001, -0.144),
+        (0.000, -0.146), (0.000, -0.148), (0.000, -0.149), (0.000, -0.151),
+        (0.000, -0.153),
+
+        /* (-0.005, -0.152), Extra data point off grid */
+
+        (-0.002, -0.145), (-0.001, -0.142),
+        (-0.001, -0.142), (-0.002, -0.142), (-0.002, -0.142), (-0.002, -0.144),
+        (-0.001, -0.146), (0.000, -0.147),
+
+        (-0.004, -0.150), (-0.003, -0.143),
+        (-0.003, -0.140), (-0.004, -0.139), (-0.004, -0.140), (-0.004, -0.141),
+        (-0.003, -0.143), (-0.001, -0.146),
+    ];
+
+    // Extra data for the top right corner of the surface plate that was not
+    // touched by any measurement. The level was turned 90 degrees for these
+    // samples
+    let special_data = &[
+        (0.142, -0.003), (0.144, -0.002), (0.148, 0.001),
+        (0.142, -0.006), (0.144, -0.002), (0.149, 0.001),
+        (0.144, -0.007), (0.145, -0.001), (0.149, 0.003),
+    ];
+
+    // All y points are negative from our data, just assert valid data entry
+    for &(x, y) in data {
+        assert!(y < 0.);
+    }
+    
+    // Compute coords for data points
+    for (ii, &(angle_x, angle_y)) in data.iter().enumerate() {
+        // y_coord
+        // ^
+        // ^
+        // ^
+        // o > > > x_coord
+        // origin
+        let origin = dvec2(((ii % 8 + 1) * 50) as f64,
+            ((ii / 8 + 1) * 50) as f64);
+        
+        println!("{origin}");
+
+        let x_coord = origin + dvec2(150., 0.);
+        let y_coord = origin + dvec2(0., 150.);
+
+        // Default measurement uncertainty to apply to angles (mm/m)
+        let uncertainty = 0.0;
+
+        // Generate ranges for the X and Y slopes
+        let angle_x = Bounds::Range(angle_x - uncertainty, angle_x + uncertainty);
+        let angle_y = Bounds::Range(angle_y - uncertainty, angle_y + uncertainty);
+
+        let mut tris = Vec::new();
+        for &coord in &[origin, x_coord, y_coord] {
+            let size = 30.;
+            let bl = coord - dvec2(size, size);
+            let tr = coord + dvec2(size, size);
+
+            tris.extend(Triangle::rectangle(bl, tr));
+        }
+
+        measurements.push(Measurement {
+            contact:        tris,
+            center_of_mass: None,
+            plane:          Plane::default(),
+            offset:         Bounds::Range(-0.25, 0.25),
+            angle_x, angle_y,
+        });
+    }
+
+    println!();
+
+    // Compute coords for special data points
+    //
+    // These are rotated clockwise 90 degrees
+    for (ii, &(angle_x, angle_y)) in special_data.iter().enumerate() {
+        // y_coord
+        // ^
+        // ^
+        // ^
+        // o > > > x_coord
+        // origin
+        let origin = dvec2(((ii / 3 + 6) * 50) as f64,
+            ((ii % 3) as isize * -50) as f64 + 400.);
+
+        println!("{origin}");
+
+        let x_coord = origin + dvec2(150., 0.);
+        let y_coord = origin - dvec2(0., 150.);
+
+        // Default measurement uncertainty to apply to angles (mm/m)
+        let uncertainty = 0.0;
+
+        let (angle_x, angle_y) = (angle_y, -angle_x);
+
+        // Generate ranges for the X and Y slopes
+        let angle_x = Bounds::Range(angle_x - uncertainty, angle_x + uncertainty);
+        let angle_y = Bounds::Range(angle_y - uncertainty, angle_y + uncertainty);
+
+        let mut tris = Vec::new();
+        for &coord in &[origin, x_coord, y_coord] {
+            let size = 30.;
+            let bl = coord - dvec2(size, size);
+            let tr = coord + dvec2(size, size);
+
+            tris.extend(Triangle::rectangle(bl, tr));
+        }
+
+        measurements.push(Measurement {
+            contact:        tris,
+            center_of_mass: None,
+            plane:          Plane::default(),
+            offset:         Bounds::Range(-0.25, 0.25),
+            angle_x, angle_y,
+        });
+    }
+}
+
 #[macroquad::main(window_conf)]
 async fn main() {
-    // Measuring tool dimensions
-    //
-    //  62.01mm
-    //  v
-    // +--+      +--+
-    // |  |======|  |< 62.20mm
-    // +--+      +--+
-    //
-    // ^------------^
-    //  273.76mm
+    let mut measurements: Vec<Measurement> = Vec::new();
 
-    // Our desired hats
-    let mut raw_hats = Vec::new();
+    surface_plate(&mut measurements);
 
-    let across_data = [-0.5_f64,-0.5,0.,-0.5,-1.,0.,-1.,-0.5,0.,0.5,0.,0.,1.,1.,1.,1.,1.5,1.5,1.5,1.5,2.,2.5,2.,2.5,];
-    let slopes_long = [1f64,0.,-0.5,-0.5,-1.,-1.,-1.,-1.,-0.5,-0.5,-1.,-1.,-1.,-1.,-1.,-1.,-1.,-2.,-2.,-2.,-2.,-2.,-1.5,-2.,-2.,-2.,];
-    let slopes_short = [0f64,0.,0.,-0.5,0.,0.,0.,0.,0.,-0.5,0.,-0.5,0.,-0.5,-0.5,0.,-0.5,0.,-0.5,-1.,];
-
-    for ii in 1..=across_data.len() {
-        // Across is:
-        //
-        // +--+
-        // |  |
-        // +--+
-        //  ||
-        //  ||
-        // +--+
-        // |  |
-        // +--+
-        // ^  ^x2
-        // ^x1
-        let x2 = ii as f64 * 40.;
-        let x1 = x2 - 62.20;
-
-        let x1 = x1.max(0.);
-        let x2 = x2.min(1005.);
-
-        let target = -across_data[ii - 1];
-
-        raw_hats.push(((f64::NAN, target * 0.050), vec![
-            (dvec2(x1, 0.), dvec2(x2, 25.4)),
-            (dvec2(x1, 0. + 215.), dvec2(x2, 25.4 + 215.)),
-        ]));
-    }
-
-    for ii in 1..=slopes_short.len() {
-        // Short way size is 1005mm
-        //
-        // +--+      +--+
-        // |  |======|  | ----> +x
-        // +--+      +--+
-        // ^  ^x2    ^  ^x4
-        // ^x1       ^x3
-        let x2 = ii as f64 * 40.;
-        let x1 = x2 - 62.01;
-        let x4 = x1 + 273.76;
-        let x3 = x4 - 62.01;
-
-        let x1 = x1.max(0.);
-        let x4 = x4.min(1005.);
-
-        raw_hats.push(((slopes_short[ii - 1] * 0.050, f64::NAN), vec![
-            (dvec2(x1, 0.), dvec2(x2, 25.4)),
-            (dvec2(x3, 0.), dvec2(x4, 25.4)),
-        ]));
-    }
-
-    for ii in 1..=slopes_long.len() {
-        // Long way size is 1240mm
-        //
-        // +--+      +--+
-        // |  |======|  | ----> +x
-        // +--+      +--+
-        // ^  ^x2    ^  ^x4
-        // ^x1       ^x3
-        let x2 = ii as f64 * 40.;
-        let x1 = x2 - 62.01;
-        let x4 = x1 + 273.76;
-        let x3 = x4 - 62.01;
-
-        let x1 = x1.max(0.);
-        let x4 = x4.min(1240.);
-
-        raw_hats.push(((slopes_long[ii - 1] * 0.050, f64::NAN), vec![
-            (dvec2(x1, 0. + 215.), dvec2(x2, 25.4 + 215.)),
-            (dvec2(x3, 0. + 215.), dvec2(x4, 25.4 + 215.)),
-        ]));
-    }
-
-    let mut measurements = Vec::new();
+    /*
     for ((angle_x, angle_y), rects) in raw_hats {
         let mut tris = Vec::new();
         for (bl, tr) in rects {
@@ -606,7 +674,7 @@ async fn main() {
             offset:         Bounds::Range(-0.25, 0.25),
             angle_x, angle_y,
         });
-    }
+    }*/
 
     // Compute overlapping rectangles
     let mut overlaps = Vec::new();
@@ -650,7 +718,7 @@ async fn main() {
     }
 
     // Save the current state
-    let state: [Arc<Mutex<State>>; 1] = std::array::from_fn(|_| {
+    let state: [Arc<Mutex<State>>; 8] = std::array::from_fn(|_| {
         Arc::new(Mutex::new(State {
             best_planes: measurements.iter_mut().map(|x| {
                 // Randomize the measurement
