@@ -493,181 +493,106 @@ impl Measurement {
     }
 }
 
-/// Surface plate measurements 2024-12-10, quick 30 minute sampling at 50mm
-/// steps before NYC flight
+/// Surface plate measurement strategy
 fn surface_plate(measurements: &mut Vec<Measurement>) {
-    // Surface plate layout
-    //
-    // |     613 mm     |
-    // +----------------+ -
-    // |                |
-    // |                | 459 mm
-    // |                |
-    // +----------------+ -
-    //
-    // There are 3mm margins on the plate (the above dimensions have 3mm of
-    // taper on all edges, thus the actual flat part of the plate removes 3mm
-    // on each side)
-    //
-    // The data is sampled with the 2d level at 50mm increments starting from
-    // the bottom left, going left to right, bottom to top
-    //
-    // The 2d level base is set at 150mm on X and Y. With 23.91mm diameter
-    // round feet.
-    //
-    // The 50mm x 50mm grid is made with a 600mm ruler centered on the plate.
-    // this adds another 3.5mm of margins on the flat part of the plate
-    //
-    // Readings are in mm/m. Positive readings are a raised "right/top" side.
-    let data = &[
-        (0.010, -0.140), (0.008, -0.145), (0.008, -0.150), (0.007, -0.154),
-        (0.003, -0.157), (0.001, -0.160), (-0.001, -0.162), (-0.003, -0.162),
-
-        (0.005, -0.141), (0.005, -0.145), (0.004, -0.148), (0.003, -0.151),
-        (0.001, -0.153), (0.001, -0.155), (0.000, -0.158), (0.000, -0.158),
-
-        /*(-0.010, -0.157), Extra data point off grid */ 
-
-        (0.000, -0.143), (0.001, -0.143), (0.001, -0.144),
-        (0.000, -0.146), (0.000, -0.148), (0.000, -0.149), (0.000, -0.151),
-        (0.000, -0.153),
-
-        /* (-0.005, -0.152), Extra data point off grid */
-
-        (-0.002, -0.145), (-0.001, -0.142),
-        (-0.001, -0.142), (-0.002, -0.142), (-0.002, -0.142), (-0.002, -0.144),
-        (-0.001, -0.146), (0.000, -0.147),
-
-        (-0.004, -0.150), (-0.003, -0.143),
-        (-0.003, -0.140), (-0.004, -0.139), (-0.004, -0.140), (-0.004, -0.141),
-        (-0.003, -0.143), (-0.001, -0.146),
-    ];
-
-    // Extra data for the top right corner of the surface plate that was not
-    // touched by any measurement. The level was turned 90 degrees for these
-    // samples
-    let special_data = &[
-        (0.142, -0.003), (0.144, -0.002), (0.148, 0.001),
-        (0.142, -0.006), (0.144, -0.002), (0.149, 0.001),
-        (0.144, -0.007), (0.145, -0.001), (0.149, 0.003),
-    ];
-
-    // All y points are negative from our data, just assert valid data entry
-    for &(_, y) in data {
-        assert!(y < 0.);
-    }
-
-    //let radius = 23.91 / 2.;
     let radius = 30.;
     let sides = 16;
-    let circle = true;
+
+    let mut raw_data = Vec::new();
+
+    // Parse the CSV data in order
+    //
+    // Data is in m/m ? CSV says RAD but it matched mm/m data on the device??
+    for filename in [
+        "data/surface_plate_20241218/wylerUNIVERSAL data 2024-12-18 01-10-10.csv",
+        "data/surface_plate_20241218/wylerUNIVERSAL data 2024-12-18 01-40-04.csv",
+        "data/surface_plate_20241218/wylerUNIVERSAL data 2024-12-18 01-56-16.csv",
+    ] {
+        for line in std::fs::read_to_string(filename).unwrap().lines().skip(1) {
+            let mut spl = line.splitn(3, ";");
+            let _date = spl.next().unwrap().splitn(3, "\"").nth(1).unwrap();
+            let x_slope = spl.next().unwrap().splitn(3, "\"").nth(1).unwrap();
+            let y_slope = spl.next().unwrap().splitn(3, "\"").nth(1).unwrap();
+            let x_slope = x_slope.parse::<f64>().unwrap() * 1000.;
+            let y_slope = y_slope.parse::<f64>().unwrap() * 1000.;
+            raw_data.push((x_slope, y_slope));
+        }
+    }
+    assert!(raw_data.len() == 108);
 
     // Compute coords for data points
-    for (ii, &(angle_x, angle_y)) in data.iter().enumerate() {
+    for (ii, &(angle_x, angle_y)) in raw_data.iter().enumerate() {
+        // Rotate 180 degrees for the second half of data
+        let reverse_set = ii / 54 == 1;
+
+        // Normalize index for both sets
+        let ii = ii % 54;
+
         // y_coord
         // ^
         // ^
         // ^
         // o > > > x_coord
         // origin
-        let origin = dvec2(((ii % 8 + 1) * 50) as f64,
-            ((ii / 8 + 1) * 50) as f64);
-
-        let x_coord = origin + dvec2(150., 0.);
-        let y_coord = origin + dvec2(0., 150.);
-
-        // Generate ranges for the X and Y slopes
-        let angle_x = Bounds::Constant(angle_x);
-        let angle_y = Bounds::Constant(angle_y);
-
-        let mut tris = Vec::new();
-        for &coord in &[origin, x_coord, y_coord] {
-            if circle {
-                tris.extend(Triangle::polygon(coord, radius, sides));
-            } else {
-                let bl = coord - dvec2(radius, radius);
-                let tr = coord + dvec2(radius, radius);
-
-                tris.extend(Triangle::rectangle(bl, tr));
-            }
-        }
-
-        measurements.push(Measurement {
-            contact:  tris,
-            centroid: None,
-            plane:    Plane::default(),
-            offset:   Bounds::Range(-0.25, 0.25),
-            last_vals: (f64::NAN, f64::NAN, f64::NAN),
-            angle_x, angle_y,
-        });
-    }
-
-    // Compute coords for special data points
-    //
-    // These are rotated clockwise 90 degrees
-    for (ii, &(angle_x, angle_y)) in special_data.iter().enumerate() {
-        // y_coord
-        // ^
-        // ^
-        // ^
-        // o > > > x_coord
-        // origin
-        let origin = dvec2(((ii / 3 + 6) * 50) as f64,
-            ((ii % 3) as isize * -50) as f64 + 400.);
-
-        let x_coord = origin + dvec2(150., 0.);
-        let y_coord = origin - dvec2(0., 150.);
-
-        let (angle_x, angle_y) = (angle_y, -angle_x);
-
-        // Generate ranges for the X and Y slopes
-        let angle_x = Bounds::Constant(angle_x);
-        let angle_y = Bounds::Constant(angle_y);
-
-        let mut tris = Vec::new();
-        for &coord in &[origin, x_coord, y_coord] {
-            if circle {
-                tris.extend(Triangle::polygon(coord, radius, sides));
-            } else {
-                let bl = coord - dvec2(radius, radius);
-                let tr = coord + dvec2(radius, radius);
-
-                tris.extend(Triangle::rectangle(bl, tr));
-            }
-        }
-
-        measurements.push(Measurement {
-            contact:  tris,
-            centroid: None,
-            plane:    Plane::default(),
-            offset:   Bounds::Range(-0.25, 0.25),
-            last_vals: (f64::NAN, f64::NAN, f64::NAN),
-            angle_x, angle_y,
-        });
-    }
-
-    // Compute average X angle and average Y angle
-    let mut sumx = 0.;
-    let mut numx = 0.;
-    let mut sumy = 0.;
-    let mut numy = 0.;
-    for Measurement { angle_x, angle_y, .. } in measurements.iter() {
-        if let (Bounds::Constant(angle_x), Bounds::Constant(angle_y)) = (angle_x, angle_y) {
-            sumx += *angle_x;
-            sumy += *angle_y;
-            numx += 1.;
-            numy += 1.;
+        let origin = if !reverse_set {
+            dvec2(53.13, 53.13) +
+            dvec2(((ii % 9) * 50) as f64, ((ii / 9) * 50) as f64)
         } else {
-            panic!();
-        }
-    }
-    let avgx = sumx / numx;
-    let avgy = sumy / numy;
+            dvec2(10. * 50. + 53.13, 7. * 50. + 53.13) -
+            dvec2(((ii % 9) * 50) as f64, ((ii / 9) * 50) as f64)
+        };
 
-    for Measurement { angle_x, angle_y, .. } in measurements.iter_mut() {
-        if let (Bounds::Constant(angle_x), Bounds::Constant(angle_y)) = (angle_x, angle_y) {
-            *angle_x -= avgx;
-            *angle_y -= avgy;
+        // Reverse data inverts the data and offsets
+        let scale = if reverse_set { -1. } else { 1. };
+
+        let x_coord = origin + (dvec2(94.90, 0.)  * scale);
+        let y_coord = origin + (dvec2(0., 100.00) * scale);
+
+        // Generate ranges for the X and Y slopes
+        let angle_x = Bounds::Constant(angle_x * scale);
+        let angle_y = Bounds::Constant(angle_y * scale);
+
+        println!("{origin} {x_coord} {y_coord} {angle_x:?} {angle_y:?}");
+
+        let mut tris = Vec::new();
+        for &coord in &[origin, x_coord, y_coord] {
+            tris.extend(Triangle::polygon(coord, radius, sides));
+        }
+
+        measurements.push(Measurement {
+            contact:  tris,
+            centroid: None,
+            plane:    Plane::default(),
+            offset:   Bounds::Range(-0.25, 0.25),
+            last_vals: (f64::NAN, f64::NAN, f64::NAN),
+            angle_x, angle_y,
+        });
+    }
+
+    for range in [0..54, 54..108] {
+        // Compute average X angle and average Y angle
+        let mut sumx = 0.;
+        let mut numx = 0.;
+        let mut sumy = 0.;
+        let mut numy = 0.;
+        for Measurement { angle_x, angle_y, .. } in measurements[range.clone()].iter() {
+            if let (Bounds::Constant(angle_x), Bounds::Constant(angle_y)) = (angle_x, angle_y) {
+                sumx += *angle_x;
+                sumy += *angle_y;
+                numx += 1.;
+                numy += 1.;
+            } else {
+                panic!();
+            }
+        }
+        let avgx = sumx / numx;
+        let avgy = sumy / numy;
+
+        for Measurement { angle_x, angle_y, .. } in measurements[range].iter_mut() {
+            if let (Bounds::Constant(angle_x), Bounds::Constant(angle_y)) = (angle_x, angle_y) {
+                *angle_x -= avgx;
+                *angle_y -= avgy;
+            }
         }
     }
 
@@ -795,10 +720,11 @@ async fn main() {
     let selected_samples = selected_samples.into_iter().collect::<Vec<_>>();
     println!("Reduced to {} samples", selected_samples.len());
 
+    /*
     assert!(visited.len() == measurements.len(),
         "Measurements were not fully connected. Increase measurements until \
          all measurements can be reached through traversing through points.
-         Measurements {} | Visited {}", measurements.len(), visited.len());
+         Measurements {} | Visited {}", measurements.len(), visited.len());*/
 
     for state in state.iter() {
         let mut measurements = measurements.clone();
@@ -885,6 +811,7 @@ async fn main() {
             samples.simplify();
 
             let camera_angle = (frame as f32 * 1.) % 360.;
+            let camera_angle: f32 = 0.;
             let camera_dist = 600.;
 
             // Start at [0, -dist], which is "standing in front of the surface
@@ -913,7 +840,7 @@ async fn main() {
 
             let (min, max) = samples.draw(&mut renderer);
 
-            writeln!(&mut msg, "Score {:7.3} um err/point | Range {:7.3} um | Iters {:10.0}/sec",
+            writeln!(&mut msg, "Score {:10.6} um err/point | Range {:7.3} um | Iters {:10.0}/sec",
                 score * 1e3,
                 (max - min) * 1e3,
                 iters as f64 / it.elapsed().as_secs_f64()).unwrap();
