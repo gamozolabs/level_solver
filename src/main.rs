@@ -26,9 +26,6 @@ struct Samples(
     /// Lookup from a measurement to samples contained in that measurement.
     /// Indexed by measurement ID
     Vec<Vec<usize>>,
-
-    /// Triangles
-    Vec<[usize; 3]>,
 );
 
 impl Samples {
@@ -45,36 +42,11 @@ impl Samples {
 
         // Generate samples in a grid
         let mut y = bl.y;
-        let mut make_tris = None;
-        let mut tris = Vec::new();
         while y <= tr.y {
             let mut x = bl.x;
             while x <= tr.x {
                 samples.push((dvec2(x, y), Vec::new(), (0., 0.)));
-
-                if let Some(row_width) = make_tris {
-                    if x > bl.x {
-                        //     v this sample
-                        // +---+
-                        // |  /|
-                        // | / |
-                        // |/  |
-                        // +---+
-                        let tr = samples.len().strict_sub(1);
-                        let tl = tr.strict_sub(1);
-                        let br = tr.strict_sub(row_width);
-                        let bl = tl.strict_sub(row_width);
-
-                        tris.push([bl, tr, tl]);
-                        tris.push([bl, br, tr]);
-                    }
-                }
-
                 x += step_size;
-            }
-
-            if make_tris.is_none() {
-                make_tris = Some(samples.len());
             }
 
             y += step_size;
@@ -99,7 +71,7 @@ impl Samples {
             }
         }
 
-        Self(samples, meas_to_samples, tris)
+        Self(samples, meas_to_samples)
     }
 
     /// Recompute samples for a given measurement set
@@ -160,36 +132,9 @@ impl Samples {
                 let z = s / n;
                 let pct = (z - min_z) / range_z;
                 let col = Renderer::color(pct);
-                renderer.draw_square(loc.extend(z), 2., col);
+                renderer.draw_square(loc.extend(z), 0.5, col);
             }
         }
-
-        /*
-        // Display the data as triangles
-        'bad_tri: for &triangle in self.2.iter() {
-            // Make sure all vertexes have valid data (at least one dep)
-            for vertex in triangle {
-                if self.0[vertex].1.len() == 0 {
-                    continue 'bad_tri;
-                }
-            }
-
-            // Produce vertices for the triangle
-            for vertex in triangle {
-                let &(loc, _, (s, n)) = &self.0[vertex];
-                let z = s / n;
-                let pct = (z - min_z) / range_z;
-                let col = Renderer::color(pct);
-
-                renderer.mesh.vertices.push(Vertex::new(
-                    loc.x as f32, loc.y as f32, (z * Z_SCALE) as f32,
-                    0., 0., col));
-            }
-
-            if renderer.mesh.vertices.len() >= 4096 {
-                renderer.flush();
-            }
-        }*/
 
         // Flush any pending triangles
         renderer.flush();
@@ -774,7 +719,7 @@ async fn main() {
     println!("State saved");
 
     // Take random samples of all the surfaces in the measurements
-    let mut samples = Samples::generate(&measurements, 0.1);
+    let mut samples = Samples::generate(&measurements, 1.);
     println!("Samples done");
 
     // Make sure that all measurements are connected. If this is not the case,
