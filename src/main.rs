@@ -1,11 +1,12 @@
 // cargo add macroquad nalgebra rand
 
-#![feature(array_windows)]
+#![feature(array_windows, strict_overflow_ops)]
 
 mod color;
 
 use std::f64::consts::*;
 use std::sync::{Arc, Mutex};
+use std::collections::BTreeSet;
 use ::rand::prelude::*;
 use macroquad::prelude::*;
 
@@ -20,21 +21,63 @@ const Z_SCALE: f64 = 40000.;
 struct Samples(
     /// Random sample points and the measurements that contain the points
     /// (xy, dependencies, (sum, count))
-    Vec<(DVec2, Vec<usize>, (f64, f64))>
+    Vec<(DVec2, Vec<usize>, (f64, f64))>,
+
+    /// Lookup from a measurement to samples contained in that measurement.
+    /// Indexed by measurement ID
+    Vec<Vec<usize>>,
+
+    /// Triangles
+    Vec<[usize; 3]>,
 );
 
 impl Samples {
-    /// Generate random set of samples for `measurements`
-    fn generate(measurements: &[Measurement], num_samples: usize) -> Self {
+    /// Generate set of samples for `measurements` with `step_size` as the grid
+    /// size from the bounding box of the measurements
+    fn generate(measurements: &[Measurement], step_size: f64) -> Self {
         let mut samples = Vec::new();
 
-        // Randomly sample all triangles
-        for meas in measurements {
-            for tri in &meas.contact {
-                for pos in tri.sample(num_samples) {
-                    samples.push((pos, Vec::new(), (0., 0.)));
+        // Find bounding box of the data, this is the bounding box of all
+        // vertices of all triangles of all measurements
+        let (bl, tr) = measurements.iter().flat_map(|meas| {
+            meas.contact.iter().flat_map(|x| x.array())
+        }).bounding_box();
+
+        // Generate samples in a grid
+        let mut y = bl.y;
+        let mut make_tris = None;
+        let mut tris = Vec::new();
+        while y <= tr.y {
+            let mut x = bl.x;
+            while x <= tr.x {
+                samples.push((dvec2(x, y), Vec::new(), (0., 0.)));
+
+                if let Some(row_width) = make_tris {
+                    if x > bl.x {
+                        //     v this sample
+                        // +---+
+                        // |  /|
+                        // | / |
+                        // |/  |
+                        // +---+
+                        let tr = samples.len().strict_sub(1);
+                        let tl = tr.strict_sub(1);
+                        let br = tr.strict_sub(row_width);
+                        let bl = tl.strict_sub(row_width);
+
+                        tris.push([bl, tr, tl]);
+                        tris.push([bl, br, tr]);
+                    }
                 }
+
+                x += step_size;
             }
+
+            if make_tris.is_none() {
+                make_tris = Some(samples.len());
+            }
+
+            y += step_size;
         }
 
         // Determine which measurements contain the sample points
@@ -48,10 +91,15 @@ impl Samples {
             }
         }
 
-        // Randomize sample ordering
-        samples.shuffle(&mut ::rand::thread_rng());
+        // Generate measurements to samples data
+        let mut meas_to_samples = vec![Vec::new(); measurements.len()];
+        for (samp_id, (_, containing, _)) in samples.iter().enumerate() {
+            for &meas_id in containing {
+                meas_to_samples[meas_id].push(samp_id);
+            }
+        }
 
-        Self(samples)
+        Self(samples, meas_to_samples, tris)
     }
 
     /// Recompute samples for a given measurement set
@@ -72,72 +120,76 @@ impl Samples {
         }
     }
 
-    /// Finds the average plane through all the points and normalizes all
-    /// the data to this plane
+    /// Normalizes all data to zero as the lowest point
     fn simplify(&mut self) {
-        // Generate matrix from data
-        let mut data = nalgebra::DMatrix::zeros(self.0.len(), 3);
-        for (ii, (pt, _, (s, n))) in self.0.iter().enumerate() {
-            data[(ii, 0)] = pt.x;
-            data[(ii, 1)] = pt.y;
-            data[(ii, 2)] = *s / *n;
-        }
-
-        // Compute centroid
-        let centroid = data.row_mean();
-
-        // Subtract centroid
-        data.row_iter_mut().for_each(|mut x| x -= &centroid);
-
-        // Compute SVD
-        let svd = data.svd(false, true);
-        let left = svd.v_t.unwrap();
-
-        // Get the right least singular value
-        let normal = left.row_iter().last().unwrap();
-
-        // Create the best fitting plane through the data
-        let plane = Plane {
-            normal: dvec3(normal[0], normal[1], normal[2]),
-            offset: 0.,
-        };
-
-        // Adjust all data to this plane
+        // Find the lowest value
         let mut min = f64::MAX;
-        for (loc, _, (sum, n)) in self.0.iter_mut() {
-            *sum -= plane.get(*loc).z * *n;
-
-            let val = *sum / *n;
-            min = min.min(val);
+        for (_, _, (sum, n)) in self.0.iter_mut() {
+            if *n > 0. {
+                let val = *sum / *n;
+                min = min.min(val);
+            }
         }
 
         // Adjust all data to zero
         for (_, _, (sum, n)) in self.0.iter_mut() {
-            *sum -= min * *n;
+            if *n > 0. {
+                *sum -= min * *n;
+            }
         }
     }
 
     /// Draw the sample points
-    fn draw(&mut self, renderer: &mut Renderer, measurements: &[Measurement])
-            -> (f64, f64) {
+    fn draw(&mut self, renderer: &mut Renderer) -> (f64, f64) {
         // Find the extents of the data
         let mut min_z = f64::MAX;
         let mut max_z = f64::MIN;
-        for &(point, _, (s, n)) in self.0.iter() {
-            let z = s / n;
-            min_z = min_z.min(z);
-            max_z = max_z.max(z);
+        for &(_, _, (s, n)) in self.0.iter() {
+            if n > 0. {
+                let z = s / n;
+                min_z = min_z.min(z);
+                max_z = max_z.max(z);
+            }
         }
 
         let range_z = max_z - min_z;
 
-        // Display the data
+        // Display the data as squares at each point
         for &(loc, _, (s, n)) in self.0.iter() {
-            let z = s / n;
-            let pct = (z - min_z) / range_z;
-            let col = Renderer::color(pct);
-            renderer.draw_square(loc.extend(z), 2., col);
+            if n > 0. {
+                let z = s / n;
+                let pct = (z - min_z) / range_z;
+                let col = Renderer::color(pct);
+                renderer.draw_square(loc.extend(z), 2., col);
+            }
         }
+
+        /*
+        // Display the data as triangles
+        'bad_tri: for &triangle in self.2.iter() {
+            // Make sure all vertexes have valid data (at least one dep)
+            for vertex in triangle {
+                if self.0[vertex].1.len() == 0 {
+                    continue 'bad_tri;
+                }
+            }
+
+            // Produce vertices for the triangle
+            for vertex in triangle {
+                let &(loc, _, (s, n)) = &self.0[vertex];
+                let z = s / n;
+                let pct = (z - min_z) / range_z;
+                let col = Renderer::color(pct);
+
+                renderer.mesh.vertices.push(Vertex::new(
+                    loc.x as f32, loc.y as f32, (z * Z_SCALE) as f32,
+                    0., 0., col));
+            }
+
+            if renderer.mesh.vertices.len() >= 4096 {
+                renderer.flush();
+            }
+        }*/
 
         // Flush any pending triangles
         renderer.flush();
@@ -351,7 +403,7 @@ impl Plane {
 }
 
 /// Different bounds a value can have
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum Bounds {
     /// An exact value
     Constant(f64),
@@ -394,6 +446,31 @@ struct Measurement {
 
     /// Offset of the backing plane
     offset: Bounds,
+
+    /// Last values picked for the angles and offset
+    last_vals: (f64, f64, f64),
+}
+
+trait BoundingBox {
+    fn bounding_box(self) -> (DVec2, DVec2);
+}
+
+impl<T: Iterator<Item = DVec2>> BoundingBox for T {
+    fn bounding_box(self) -> (DVec2, DVec2) {
+        let mut xmin = f64::MAX;
+        let mut xmax = f64::MIN;
+        let mut ymin = f64::MAX;
+        let mut ymax = f64::MIN;
+
+        for vertex in self {
+            xmin = xmin.min(vertex.x);
+            ymin = ymin.min(vertex.y);
+            xmax = xmax.max(vertex.x);
+            ymax = ymax.max(vertex.y);
+        }
+
+        (dvec2(xmin, ymin), dvec2(xmax, ymax))
+    }
 }
 
 impl Measurement {
@@ -417,32 +494,32 @@ impl Measurement {
         }
     }
 
-    /// Compute the bounding box for the surface
-    #[allow(dead_code)]
-    fn bounding_box(&self) -> (DVec2, DVec2) {
-        let mut xmin = f64::MAX;
-        let mut xmax = f64::MIN;
-        let mut ymin = f64::MAX;
-        let mut ymax = f64::MIN;
-
-        for tri in &self.contact {
-            for vertex in tri.array() {
-                xmin = xmin.min(vertex.x);
-                ymin = ymin.min(vertex.y);
-                xmax = xmax.max(vertex.x);
-                ymax = ymax.max(vertex.y);
-            }
-        }
-
-        (dvec2(xmin, ymin), dvec2(xmax, ymax))
-    }
-
     /// Randomly sample the internal bounds and regenerate the plane
     fn mutate(&mut self) {
         // Pick random values for the measurements
-        let angle_x = self.angle_x.sample();
-        let angle_y = self.angle_y.sample();
-        let offset  = self.offset.sample();
+        let mut angle_x = self.angle_x.sample();
+        let mut angle_y = self.angle_y.sample();
+        let mut offset  = self.offset.sample();
+
+        // Move towards the sample
+        let bias = 0.001;
+        for (old, target) in [
+            (self.last_vals.0, &mut angle_x),
+            (self.last_vals.1, &mut angle_y),
+            (self.last_vals.2, &mut offset),
+        ] {
+            if !old.is_nan() {
+                let val = old * (1. - bias) + *target * bias;
+                *target = val;
+            } else {
+                // Take random initial sample. This is mandatory as the angles
+                // may be fixed and thus we must start with them (rather than
+                // zero or something).
+            }
+        }
+
+        // Update the last vals
+        self.last_vals = (angle_x, angle_y, offset);
 
         // Compute the centroid
         let centroid = self.centroid();
@@ -531,17 +608,17 @@ fn surface_plate(measurements: &mut Vec<Measurement>) {
     ];
 
     // All y points are negative from our data, just assert valid data entry
-    for &(x, y) in data {
+    for &(_, y) in data {
         assert!(y < 0.);
     }
 
     //let radius = 23.91 / 2.;
-    let radius = 80. / 2.;
-    let sides = 36;
+    let radius = 30.;
+    let sides = 16;
     let circle = true;
 
     // Compute coords for data points
-    'next: for (ii, &(angle_x, angle_y)) in data.iter().enumerate() {
+    for (ii, &(angle_x, angle_y)) in data.iter().enumerate() {
         // y_coord
         // ^
         // ^
@@ -551,24 +628,12 @@ fn surface_plate(measurements: &mut Vec<Measurement>) {
         let origin = dvec2(((ii % 8 + 1) * 50) as f64,
             ((ii / 8 + 1) * 50) as f64);
 
-        println!("{origin}");
-
         let x_coord = origin + dvec2(150., 0.);
         let y_coord = origin + dvec2(0., 150.);
 
-        // Default measurement uncertainty to apply to angles (mm/m)
-        let uncertainty = 0.0;
-
         // Generate ranges for the X and Y slopes
-        let angle_x = Bounds::Range(angle_x - uncertainty, angle_x + uncertainty);
-        let angle_y = Bounds::Range(angle_y - uncertainty, angle_y + uncertainty);
-
-        for &coord in &[origin, x_coord, y_coord] {
-            if coord.x % 150. != 50. || coord.y % 150. != 50. {
-                //println!("FILTER");
-                //continue 'next;
-            }
-        }
+        let angle_x = Bounds::Constant(angle_x);
+        let angle_y = Bounds::Constant(angle_y);
 
         let mut tris = Vec::new();
         for &coord in &[origin, x_coord, y_coord] {
@@ -587,16 +652,15 @@ fn surface_plate(measurements: &mut Vec<Measurement>) {
             centroid: None,
             plane:    Plane::default(),
             offset:   Bounds::Range(-0.25, 0.25),
+            last_vals: (f64::NAN, f64::NAN, f64::NAN),
             angle_x, angle_y,
         });
     }
 
-    println!();
-
     // Compute coords for special data points
     //
     // These are rotated clockwise 90 degrees
-    'next: for (ii, &(angle_x, angle_y)) in special_data.iter().enumerate() {
+    for (ii, &(angle_x, angle_y)) in special_data.iter().enumerate() {
         // y_coord
         // ^
         // ^
@@ -606,26 +670,14 @@ fn surface_plate(measurements: &mut Vec<Measurement>) {
         let origin = dvec2(((ii / 3 + 6) * 50) as f64,
             ((ii % 3) as isize * -50) as f64 + 400.);
 
-        println!("{origin}");
-
         let x_coord = origin + dvec2(150., 0.);
         let y_coord = origin - dvec2(0., 150.);
-
-        // Default measurement uncertainty to apply to angles (mm/m)
-        let uncertainty = 0.0;
 
         let (angle_x, angle_y) = (angle_y, -angle_x);
 
         // Generate ranges for the X and Y slopes
-        let angle_x = Bounds::Range(angle_x - uncertainty, angle_x + uncertainty);
-        let angle_y = Bounds::Range(angle_y - uncertainty, angle_y + uncertainty);
-
-        for &coord in &[origin, x_coord, y_coord] {
-            if coord.x % 150. != 50. || coord.y % 150. != 50. {
-                //println!("FILTER");
-                //continue 'next;
-            }
-        }
+        let angle_x = Bounds::Constant(angle_x);
+        let angle_y = Bounds::Constant(angle_y);
 
         let mut tris = Vec::new();
         for &coord in &[origin, x_coord, y_coord] {
@@ -644,9 +696,37 @@ fn surface_plate(measurements: &mut Vec<Measurement>) {
             centroid: None,
             plane:    Plane::default(),
             offset:   Bounds::Range(-0.25, 0.25),
+            last_vals: (f64::NAN, f64::NAN, f64::NAN),
             angle_x, angle_y,
         });
     }
+
+    // Compute average X angle and average Y angle
+    let mut sumx = 0.;
+    let mut numx = 0.;
+    let mut sumy = 0.;
+    let mut numy = 0.;
+    for Measurement { angle_x, angle_y, .. } in measurements.iter() {
+        if let (Bounds::Constant(angle_x), Bounds::Constant(angle_y)) = (angle_x, angle_y) {
+            sumx += *angle_x;
+            sumy += *angle_y;
+            numx += 1.;
+            numy += 1.;
+        } else {
+            panic!();
+        }
+    }
+    let avgx = sumx / numx;
+    let avgy = sumy / numy;
+
+    for Measurement { angle_x, angle_y, .. } in measurements.iter_mut() {
+        if let (Bounds::Constant(angle_x), Bounds::Constant(angle_y)) = (angle_x, angle_y) {
+            *angle_x -= avgx;
+            *angle_y -= avgy;
+        }
+    }
+
+    //panic!();
 }
 
 /// Construct window configuration
@@ -676,36 +756,6 @@ async fn main() {
         iters: u64,
     }
 
-    // Compute overlapping rectangles
-    let mut overlaps = Vec::new();
-    for m1 in 0..measurements.len() {
-        for m2 in 0..measurements.len() {
-            let m1b = measurements[m1].bounding_box();
-            let m2b = measurements[m2].bounding_box();
-
-            // Compute overlapping rectangle coords
-            let bl = dvec2(
-                m1b.0.x.max(m2b.0.x),
-                m1b.0.y.max(m2b.0.y),
-            );
-            let tr = dvec2(
-                m1b.1.x.min(m2b.1.x),
-                m1b.1.y.min(m2b.1.y),
-            );
-
-            if tr.x >= bl.x && tr.y >= bl.y {
-                // If there is overlap, record the overlapping box and the two
-                // measurements that overlap
-                overlaps.push(([
-                    bl,
-                    tr,
-                    dvec2(bl.x, tr.y),
-                    dvec2(tr.x, bl.y),
-                ], m1, m2));
-            }
-        }
-    }
-
     // Save the current state
     let state: [Arc<Mutex<State>>; SURFACES] = std::array::from_fn(|_| {
         Arc::new(Mutex::new(State {
@@ -721,14 +771,95 @@ async fn main() {
         }))
     });
 
+    println!("State saved");
+
     // Take random samples of all the surfaces in the measurements
-    let mut samples = Samples::generate(&measurements, 1);
+    let mut samples = Samples::generate(&measurements, 0.1);
+    println!("Samples done");
+
+    // Make sure that all measurements are connected. If this is not the case,
+    // the measurements will not be able to orient themselves to the same Z
+    // location. Either increase samples to generate a point in a small overlap
+    // or measure differently to ensure the points are connected
+    let mut visited = BTreeSet::new();
+    let mut connectivity =
+        vec![vec![BTreeSet::new(); measurements.len()]; measurements.len()];
+    let mut to_visit = vec![0];
+
+    while let Some(meas_id) = to_visit.pop() {
+        if !visited.insert(meas_id) {
+            continue;
+        }
+
+        // Go through all samples contained in this measurement
+        for &sample_id in samples.1[meas_id].iter() {
+            // Go through all measurements used by these samples
+            for &next_meas in &samples.0[sample_id].1 {
+                to_visit.push(next_meas);
+
+                // Record the connection between the two measurements
+                connectivity[meas_id][next_meas].insert(sample_id);
+            }
+        }
+    }
+
+    let mut selected_samples = BTreeSet::new();
+    for m1 in 0..measurements.len() {
+        for m2 in 0..measurements.len() {
+            // Get a list of all points that connect these two measurements
+            let conns = &connectivity[m1][m2];
+
+            // Require we have a decent sampling of points that connect the
+            // two measurements. This just ensures we get a wider selection of
+            // points.
+            if conns.len() >= 20 {
+                // Find the two furthest X and Y values from each other. This
+                // will give us 4 points. These will be the 4 points we
+                // actually use to minimize error. This will give us the four
+                // most extreme points that connect the two measurements.
+                //
+                // The theory is that since the two measurements are planes,
+                // the lines connecting the furthest X and furthest Y values
+                // must provide the most extreme errors as the Z values will
+                // diverge the most at the extremes.
+                let mut min_x = (f64::MAX, 0);
+                let mut max_x = (f64::MIN, 0);
+                let mut min_y = (f64::MAX, 0);
+                let mut max_y = (f64::MIN, 0);
+                for &sample_id in conns {
+                    // Get the position of the sample
+                    let pos = samples.0[sample_id].0;
+
+                    if pos.x < min_x.0 { min_x = (pos.x, sample_id); }
+                    if pos.x > max_x.0 { max_x = (pos.x, sample_id); }
+                    if pos.y < min_y.0 { min_y = (pos.y, sample_id); }
+                    if pos.y > max_y.0 { max_y = (pos.y, sample_id); }
+                }
+
+                // Record the samples
+                selected_samples.insert(min_x.1);
+                selected_samples.insert(max_x.1);
+                selected_samples.insert(min_y.1);
+                selected_samples.insert(max_y.1);
+            } else {
+                assert!(conns.len() == 0, "Connectivity is not strong enough \
+                    between measurements {m1} and {m2}");
+            }
+        }
+    }
+    let selected_samples = selected_samples.into_iter().collect::<Vec<_>>();
+    println!("Reduced to {} samples", selected_samples.len());
+
+    assert!(visited.len() == measurements.len(),
+        "Measurements were not fully connected. Increase measurements until \
+         all measurements can be reached through traversing through points.
+         Measurements {} | Visited {}", measurements.len(), visited.len());
 
     for state in state.iter() {
         let mut measurements = measurements.clone();
         let state = state.clone();
         let samples = samples.clone();
-        let overlaps = overlaps.clone();
+        let selected_samples = selected_samples.clone();
 
         std::thread::spawn(move || {
             loop {
@@ -747,33 +878,22 @@ async fn main() {
                     measurements[sel].mutate();
                 }
 
-                /*
                 // Compute the overlap distances
                 let mut sum_dist = 0.;
                 let mut num_dist = 0.;
-                for &(points, m1, m2) in &overlaps {
-                    for point in points {
-                        let z1 = measurements[m1].plane.get(point).z;
-                        let z2 = measurements[m2].plane.get(point).z;
-                        sum_dist += (z2 - z1).abs();
+                for &sample_id in &selected_samples {
+                    let &(point, ref deps, _) = &samples.0[sample_id];
+                    if !deps.is_empty() {
+                        let mut min = f64::MAX;
+                        let mut max = f64::MIN;
+                        for &dep in deps {
+                            min = min.min(measurements[dep].plane.get(point).z);
+                            max = max.max(measurements[dep].plane.get(point).z);
+                        }
+
+                        sum_dist += (max - min).abs();
                         num_dist += 1.;
                     }
-                }
-                let avg_dist = sum_dist / num_dist;*/
-
-                // Compute the overlap distances
-                let mut sum_dist = 0.;
-                let mut num_dist = 0.;
-                for &(point, ref deps, _) in &samples.0 {
-                    let mut min = f64::MAX;
-                    let mut max = f64::MIN;
-                    for &dep in deps {
-                        min = min.min(measurements[dep].plane.get(point).z);
-                        max = max.max(measurements[dep].plane.get(point).z);
-                    }
-
-                    sum_dist += (max - min).abs();
-                    num_dist += 1.;
                 }
                 let avg_dist = sum_dist / num_dist;
 
@@ -819,10 +939,18 @@ async fn main() {
             samples.recompute(&measurements);
             samples.simplify();
 
+            let camera_angle = (frame as f32 * 1.) % 360.;
+            let camera_dist = 600.;
+
+            // Start at [0, -dist], which is "standing in front of the surface
+            // plate"
+            let camera_x_off = camera_dist * camera_angle.to_radians().sin();
+            let camera_y_off = -camera_dist * camera_angle.to_radians().cos();
+
             // Average the data
             let mut sum = dvec3(0., 0., 0.);
             let mut cnt = 0.;
-            for pt in samples.0.iter().map(|(pt, _, (s, n))| pt.extend(s / n)) {
+            for pt in samples.0.iter().flat_map(|(pt, _, (s, n))| if *n > 0. { Some(pt.extend(s / n)) } else { None }) {
                 sum += pt;
                 cnt += 1.;
             }
@@ -832,13 +960,13 @@ async fn main() {
             let target = vec3(avg.x as f32, avg.y as f32, (avg.z * Z_SCALE) as f32);
 
             set_camera(&Camera3D {
-                position: vec3(target.x, target.y - 600., target.z + 600.),
+                position: vec3(target.x + camera_x_off, target.y + camera_y_off, target.z + 600.),
                 up: vec3(0., 0., 1.),
                 target,
                 ..Default::default()
             });
 
-            let (min, max) = samples.draw(&mut renderer, &measurements);
+            let (min, max) = samples.draw(&mut renderer);
 
             writeln!(&mut msg, "Score {:7.3} um err/point | Range {:7.3} um | Iters {:10.0}/sec",
                 score * 1e3,
