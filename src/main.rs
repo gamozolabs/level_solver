@@ -12,7 +12,7 @@ use ::rand::prelude::*;
 use macroquad::prelude::*;
 
 /// Number of surfaces to create (also number of threads)
-const SURFACES: usize = 4;
+const SURFACES: usize = 16;
 
 /// Extra Z-scale multiplication for rendering only. This is to visually
 /// amplify the Z axis.
@@ -129,7 +129,8 @@ impl Samples {
     }
 
     /// Draw the sample points
-    fn draw(&mut self, renderer: &mut Renderer) -> (f64, f64) {
+    fn draw(&mut self, renderer: &mut Renderer, visited: &BTreeSet<usize>)
+            -> (f64, f64) {
         // Find the extents of the data
         let mut min_z = f64::MAX;
         let mut max_z = f64::MIN;
@@ -144,11 +145,15 @@ impl Samples {
         let range_z = max_z - min_z;
 
         // Display the data as squares at each point
-        for &(loc, _, (s, n)) in self.0.iter() {
+        for &(loc, ref deps, (s, n)) in self.0.iter() {
             if n > 0. {
                 let z = s / n;
                 let pct = (z - min_z) / range_z;
-                let col = Renderer::color(pct);
+                let col = if visited.contains(&deps[0]) {
+                    Renderer::color(pct)
+                } else {
+                    Color::from_rgba(20, 20, 20, 255)
+                };
                 renderer.draw_square(loc.extend(z), 1.5, col);
             }
         }
@@ -558,6 +563,9 @@ fn surface_plate(measurements: &mut Vec<Measurement>) {
         "data/surface_plate_20241218/wylerUNIVERSAL data 2024-12-18 01-10-10.csv",
         "data/surface_plate_20241218/wylerUNIVERSAL data 2024-12-18 01-40-04.csv",
         "data/surface_plate_20241218/wylerUNIVERSAL data 2024-12-18 01-56-16.csv",
+        "data/surface_plate_20241218/wylerUNIVERSAL data 2024-12-18 19-22-32.csv",
+        "data/surface_plate_20241218/wylerUNIVERSAL data 2024-12-18 19-41-12.csv",
+        "data/surface_plate_20241218/wylerUNIVERSAL data 2024-12-18 21-59-55.csv",
     ] {
         for line in std::fs::read_to_string(filename).unwrap().lines().skip(1) {
             let mut spl = line.splitn(3, ";");
@@ -569,39 +577,68 @@ fn surface_plate(measurements: &mut Vec<Measurement>) {
             raw_data.push((x_slope, y_slope));
         }
     }
-    assert!(raw_data.len() == 108);
+    assert!(raw_data.len() == 108 + 48*2 + 15);
+
+    fn set1(ii: usize) -> DVec2 {
+        dvec2(53.13, 53.13) +
+        dvec2(((ii % 9) * 50) as f64, ((ii / 9) * 50) as f64)
+    }
+    fn set2(ii: usize) -> DVec2 {
+        dvec2(10. * 50. + 53.13, 7. * 50. + 53.13) -
+        dvec2(((ii % 9) * 50) as f64, ((ii / 9) * 50) as f64)
+    }
+    fn set3(ii: usize) -> DVec2 {
+        dvec2(53.13, 7. * 50. + 53.13) +
+        dvec2(((ii / 6) * 50) as f64, -(((ii % 6) * 50) as f64))
+    }
+    fn set4(ii: usize) -> DVec2 {
+        dvec2(10. * 50. + 53.13, 53.13) +
+        dvec2(-(((ii / 6) * 50) as f64), ((ii % 6) * 50) as f64)
+    }
+    fn set5(ii: usize) -> DVec2 {
+        dvec2(53.13, 53.13) +
+        dvec2(((ii % 5) * 100) as f64, ((ii / 5) * 100) as f64)
+    }
+
+    // (number of points, points per row, rotation)
+    let sets = [
+        (54, 9, 94.90, 100.00, DVec2::from_angle(0f64.to_radians()), set1 as fn(usize) -> DVec2),
+        (54, 9, 94.90, 100.00, DVec2::from_angle(180f64.to_radians()), set2 as fn(usize) -> DVec2),
+        (48, 6, 94.90, 150.04, DVec2::from_angle(270f64.to_radians()), set3 as fn(usize) -> DVec2),
+        (48, 6, 94.90, 150.04, DVec2::from_angle(90f64.to_radians()), set4 as fn(usize) -> DVec2),
+        (15, 5, 94.90, 150.04, DVec2::from_angle(0f64.to_radians()), set5 as fn(usize) -> DVec2),
+    ];
 
     // Compute coords for data points
-    for (ii, &(angle_x, angle_y)) in raw_data.iter().enumerate() {
-        // Rotate 180 degrees for the second half of data
-        let reverse_set = ii / 54 == 1;
+    let mut set_id = 0;
+    let mut ii = 0;
+    for &(angle_x, angle_y) in raw_data.iter() {
+        let set = sets[set_id];
 
-        // Normalize index for both sets
-        let ii = ii % 54;
+        if ii >= set.0 {
+            set_id += 1;
+            ii = 0;
+        }
 
-        // y_coord
-        // ^
-        // ^
-        // ^
-        // o > > > x_coord
-        // origin
-        let origin = if !reverse_set {
-            dvec2(53.13, 53.13) +
-            dvec2(((ii % 9) * 50) as f64, ((ii / 9) * 50) as f64)
-        } else {
-            dvec2(10. * 50. + 53.13, 7. * 50. + 53.13) -
-            dvec2(((ii % 9) * 50) as f64, ((ii / 9) * 50) as f64)
-        };
+        let set = sets[set_id];
 
-        // Reverse data inverts the data and offsets
-        let scale = if reverse_set { -1. } else { 1. };
+        // Get the origin
+        let origin = set.5(ii);
 
-        let x_coord = origin + (dvec2(94.90, 0.)  * scale);
-        let y_coord = origin + (dvec2(0., 100.00) * scale);
+        let x_coord = origin + set.4.rotate(dvec2(set.2, 0.));
+        let y_coord = origin + set.4.rotate(dvec2(0., set.3));
 
         // Generate ranges for the X and Y slopes
-        let angle_x = Bounds::Constant(angle_x * scale);
-        let angle_y = Bounds::Constant(angle_y * scale);
+        let (angle_x, angle_y) = match set_id {
+            0 => (angle_x, angle_y),
+            1 => (-angle_x, -angle_y),
+            2 => (angle_y, -angle_x),
+            3 => (-angle_y, angle_x),
+            4 => (angle_x, angle_y),
+            _ => unreachable!(),
+        };
+        let angle_x = Bounds::Constant(angle_x);
+        let angle_y = Bounds::Constant(angle_y);
 
         let mut tris = Vec::new();
         let mut bbs = Vec::new();
@@ -625,9 +662,11 @@ fn surface_plate(measurements: &mut Vec<Measurement>) {
             bounding_boxes: bbs,
             angle_x, angle_y,
         });
+
+        ii += 1;
     }
 
-    for range in [0..54, 54..108] {
+    for range in [0..54, 54..108, 108..156, 156..204, 204..219] {
         // Compute average X angle and average Y angle
         let mut sumx = 0.;
         let mut numx = 0.;
@@ -653,8 +692,6 @@ fn surface_plate(measurements: &mut Vec<Measurement>) {
             }
         }
     }
-
-    //panic!();
 }
 
 /// Construct window configuration
@@ -662,6 +699,9 @@ fn window_conf() -> Conf {
     Conf {
         window_title: "Window name".to_owned(),
         sample_count: 8, // MSAA
+        fullscreen: true,
+        window_width: 1920,
+        window_height: 1080,
         ..Default::default()
     }
 }
@@ -787,11 +827,13 @@ async fn main() {
     println!("[{:14.6}] Reduced to {} samples",
         it.elapsed().as_secs_f64(), selected_samples.len());
 
-    /*
-    assert!(visited.len() == measurements.len(),
-        "Measurements were not fully connected. Increase measurements until \
+    if visited.len() != measurements.len() {
+        panic!(
+        "WARNING: Measurements were not fully connected. Increase \
+         measurements until \
          all measurements can be reached through traversing through points.
-         Measurements {} | Visited {}", measurements.len(), visited.len());*/
+         Measurements {} | Visited {}", measurements.len(), visited.len());
+    }
 
     for state in state.iter() {
         let mut measurements = measurements.clone();
@@ -905,7 +947,7 @@ async fn main() {
                 ..Default::default()
             });
 
-            let (min, max) = samples.draw(&mut renderer);
+            let (min, max) = samples.draw(&mut renderer, &visited);
 
             writeln!(&mut msg, "Score {:10.6} um err/point | Range {:7.3} um | Iters {:10.0}/sec",
                 score * 1e3,
@@ -932,6 +974,11 @@ async fn main() {
                 draw_text(&format!("{:.2} um", (normal * range.1 + range.0) * 1e3), pixel as f32, 55., 16., Renderer::color(normal));
             }
         }
+
+        let image = get_screen_data();
+        image.export_png("screenshot.png");
+        println!("[{:14.6}] Drew image for frame {}",
+            it.elapsed().as_secs_f64(), frame);
 
         next_frame().await;
     }

@@ -61,3 +61,41 @@ Example ordering and orientation (not to scale):
                         v
                        +y
 
+-------------------------------------------------------------------------------
+
+'wylerUNIVERSAL data 2024-12-18 19-22-32.csv'
+
+The origin foot at (0, 0) is 23.92mm in diameter with a 1.90mm thick wall
+The X at (94.90, 0) is 23.91mm in diameter with a 1.90mm thick wall
+The Y at (0, 150.04) is 23.92mm in diameter with a 1.89mm thick wall
+
+Example ordering and orientation (not to scale):
+
+      L +---------------+> +y
+      A | 1  5          |
+      B | 2  6          |
+      E | 3  7          |
+      L | 4  .          |
+        +---------------+
+        v
+       +x
+
+-------------------------------------------------------------------------------
+
+'wylerUNIVERSAL data 2024-12-18 19-41-12.csv'
+
+The origin foot at (0, 0) is 23.92mm in diameter with a 1.90mm thick wall
+The X at (94.90, 0) is 23.91mm in diameter with a 1.90mm thick wall
+The Y at (0, 150.04) is 23.92mm in diameter with a 1.89mm thick wall
+
+Example ordering and orientation (not to scale):
+
+                        +x
+                        ^
+      L +---------------+
+      A |          .  4 |
+      B |          7  3 |
+      E |          6  2 |
+      L |          5  1 |
+   +y<- +---------------+
+
