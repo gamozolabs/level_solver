@@ -6,12 +6,13 @@ mod color;
 
 use std::f64::consts::*;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use std::collections::BTreeSet;
 use ::rand::prelude::*;
 use macroquad::prelude::*;
 
 /// Number of surfaces to create (also number of threads)
-const SURFACES: usize = 8;
+const SURFACES: usize = 4;
 
 /// Extra Z-scale multiplication for rendering only. This is to visually
 /// amplify the Z axis.
@@ -55,9 +56,25 @@ impl Samples {
         // Determine which measurements contain the sample points
         for (point, containing, _) in samples.iter_mut() {
             for (ii, meas) in measurements.iter().enumerate() {
-                for tri in &meas.contact {
-                    if tri.contains(*point) {
-                        containing.push(ii);
+                // First check if the point is in any of the bounding boxes
+                // for the measurement (rough but cheap)
+                let mut found = false;
+                for bb in &meas.bounding_boxes {
+                    if point.x >= bb.0.x && point.x <= bb.1.x &&
+                            point.y >= bb.0.y && point.y <= bb.1.y {
+                        found = true;
+                        break;
+                    }
+                }
+
+                if found {
+                    // Next check if there is an actual contact triangle that
+                    // contains this point
+                    for tri in &meas.contact {
+                        if tri.contains(*point) {
+                            containing.push(ii);
+                            break;
+                        }
                     }
                 }
             }
@@ -132,7 +149,7 @@ impl Samples {
                 let z = s / n;
                 let pct = (z - min_z) / range_z;
                 let col = Renderer::color(pct);
-                renderer.draw_square(loc.extend(z), 0.5, col);
+                renderer.draw_square(loc.extend(z), 1.5, col);
             }
         }
 
@@ -314,6 +331,33 @@ impl Triangle {
 
         tris
     }
+
+    /// Create a polygon out of triangles with a given amount of sides and
+    /// a hole in the center
+    pub fn donut(center: DVec2, inner: f64, outer: f64, sides: usize)
+            -> Vec<Self> {
+        // Compute the angle of a side
+        let step = TAU / sides as f64;
+
+        let mut tris = Vec::new();
+        for side in 0..sides {
+            let a1 = DVec2::from_angle((side + 0) as f64 * step);
+            let a2 = DVec2::from_angle((side + 1) as f64 * step);
+
+            tris.push(Self {
+                a: center + a1.rotate(dvec2(inner, 0.)),
+                b: center + a1.rotate(dvec2(outer, 0.)),
+                c: center + a2.rotate(dvec2(outer, 0.)),
+            });
+            tris.push(Self {
+                a: center + a1.rotate(dvec2(inner, 0.)),
+                b: center + a2.rotate(dvec2(outer, 0.)),
+                c: center + a2.rotate(dvec2(inner, 0.)),
+            });
+        }
+
+        tris
+    }
 }
 
 /// An infinite plane which can be sampled for `z` values from a given `xy`
@@ -374,6 +418,11 @@ impl Bounds {
 struct Measurement {
     /// Contact points for the measurement
     contact: Vec<Triangle>,
+
+    /// Bounding boxes for the contact points of the measurement. This helps
+    /// allow for quickly checking if a measurement contains a point, before
+    /// checking triangles.
+    bounding_boxes: Vec<(DVec2, DVec2)>,
 
     /// Centroid for the contact patch. This is considered the origin for the
     /// `plane`
@@ -495,7 +544,9 @@ impl Measurement {
 
 /// Surface plate measurement strategy
 fn surface_plate(measurements: &mut Vec<Measurement>) {
-    let radius = 30.;
+    let radius = 23.91 / 2.;
+    //let radius = 30.;
+    let inner_radius = radius - 1.9;
     let sides = 16;
 
     let mut raw_data = Vec::new();
@@ -552,11 +603,17 @@ fn surface_plate(measurements: &mut Vec<Measurement>) {
         let angle_x = Bounds::Constant(angle_x * scale);
         let angle_y = Bounds::Constant(angle_y * scale);
 
-        println!("{origin} {x_coord} {y_coord} {angle_x:?} {angle_y:?}");
-
         let mut tris = Vec::new();
+        let mut bbs = Vec::new();
         for &coord in &[origin, x_coord, y_coord] {
-            tris.extend(Triangle::polygon(coord, radius, sides));
+            let shape = Triangle::donut(coord, inner_radius, radius, sides);
+
+            // Record the bounding box of the shape
+            let bb = shape.iter().flat_map(|x| x.array()).bounding_box();
+            bbs.push(bb);
+
+            // Record the individual triangles that make up the shape
+            tris.extend(shape);
         }
 
         measurements.push(Measurement {
@@ -565,6 +622,7 @@ fn surface_plate(measurements: &mut Vec<Measurement>) {
             plane:    Plane::default(),
             offset:   Bounds::Range(-0.25, 0.25),
             last_vals: (f64::NAN, f64::NAN, f64::NAN),
+            bounding_boxes: bbs,
             angle_x, angle_y,
         });
     }
@@ -610,10 +668,14 @@ fn window_conf() -> Conf {
 
 #[macroquad::main(window_conf)]
 async fn main() {
+    let it = Instant::now();
+
     let mut measurements: Vec<Measurement> = Vec::new();
 
     // Construct the measurements needed for the surface plate
     surface_plate(&mut measurements);
+    println!("[{:14.6}] Generated measurements for the surface plate",
+        it.elapsed().as_secs_f64());
 
     struct State {
         /// Best planes for measurements we've found so far
@@ -641,11 +703,15 @@ async fn main() {
         }))
     });
 
-    println!("State saved");
+    println!("[{:14.6}] Created per-thread measurements with random \
+              starting constraints",
+        it.elapsed().as_secs_f64());
 
     // Take random samples of all the surfaces in the measurements
-    let mut samples = Samples::generate(&measurements, 1.);
-    println!("Samples done");
+    let mut samples = Samples::generate(&measurements, 0.1);
+
+    println!("[{:14.6}] Generated samples",
+        it.elapsed().as_secs_f64());
 
     // Make sure that all measurements are connected. If this is not the case,
     // the measurements will not be able to orient themselves to the same Z
@@ -718,7 +784,8 @@ async fn main() {
         }
     }
     let selected_samples = selected_samples.into_iter().collect::<Vec<_>>();
-    println!("Reduced to {} samples", selected_samples.len());
+    println!("[{:14.6}] Reduced to {} samples",
+        it.elapsed().as_secs_f64(), selected_samples.len());
 
     /*
     assert!(visited.len() == measurements.len(),
