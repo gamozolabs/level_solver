@@ -16,7 +16,7 @@ const SURFACES: usize = 16;
 
 /// Extra Z-scale multiplication for rendering only. This is to visually
 /// amplify the Z axis.
-const Z_SCALE: f64 = 40000.;
+const Z_SCALE: f64 = 4000.;
 
 #[derive(Clone)]
 struct Samples(
@@ -27,6 +27,9 @@ struct Samples(
     /// Lookup from a measurement to samples contained in that measurement.
     /// Indexed by measurement ID
     Vec<Vec<usize>>,
+
+    /// Offset after zero correction
+    f64,
 );
 
 impl Samples {
@@ -88,7 +91,7 @@ impl Samples {
             }
         }
 
-        Self(samples, meas_to_samples)
+        Self(samples, meas_to_samples, 0.)
     }
 
     /// Recompute samples for a given measurement set
@@ -126,6 +129,8 @@ impl Samples {
                 *sum -= min * *n;
             }
         }
+
+        self.2 = -min;
     }
 
     /// Draw the sample points
@@ -547,6 +552,180 @@ impl Measurement {
     }
 }
 
+fn lathe_bed(measurements: &mut Vec<Measurement>) {
+    // Measuring tool dimensions
+    //
+    //  62.01mm
+    //  v
+    // +--+      +--+
+    // |  |======|  |< 62.20mm
+    // +--+      +--+
+    //
+    // ^------------^
+    //  273.76mm
+
+    let across_data = [-0.5,-0.5,0.,-0.5,-1.,0.,-1.,-0.5,0.,0.5,0.,0.,1.,1.,1.,1.,1.5,1.5,1.5,1.5,2.,2.5,2.,2.5,];
+    let slopes_long = [1.,0.,-0.5,-0.5,-1.,-1.,-1.,-1.,-0.5,-0.5,-1.,-1.,-1.,-1.,-1.,-1.,-1.,-2.,-2.,-2.,-2.,-2.,-1.5,-2.,-2.,-2.,];
+    let slopes_short = [0.,0.,0.,-0.5,0.,0.,0.,0.,0.,-0.5,0.,-0.5,0.,-0.5,-0.5,0.,-0.5,0.,-0.5,-1.,];
+
+    for ii in 1..=across_data.len() {
+        // Across is:
+        //
+        // +--+
+        // |  |
+        // +--+
+        //  ||
+        //  ||
+        // +--+
+        // |  |
+        // +--+
+        // ^  ^x2
+        // ^x1
+        let x2 = ii as f64 * 40.;
+        let x1 = x2 - 62.20;
+
+        let origin = dvec2(x1, 0.);
+        let other  = dvec2(x1, 215.);
+
+        let mut tris = Vec::new();
+        let mut bbs = Vec::new();
+        for (ii, &coord) in [origin, other].iter().enumerate() {
+            let mut coord1 = coord;
+            let mut coord2 = coord + dvec2(62.20, 62.01);
+
+            if ii == 0 {
+                coord1.x = coord1.x.clamp(0., 1005.);
+                coord1.y = coord1.y.clamp(0., 25.4);
+                coord2.x = coord2.x.clamp(0., 1005.);
+                coord2.y = coord2.y.clamp(0., 25.4);
+            } else {
+                coord1.x = coord1.x.clamp(0., 1240.);
+                coord1.y = coord1.y.clamp(215., 215. + 25.4);
+                coord2.x = coord2.x.clamp(0., 1240.);
+                coord2.y = coord2.y.clamp(215., 215. + 25.4);
+            }
+
+            let shape = Triangle::rectangle(coord1, coord2);
+
+            // Record the bounding box of the shape
+            let bb = shape.iter().flat_map(|x| x.array()).bounding_box();
+            bbs.push(bb);
+
+            // Record the individual triangles that make up the shape
+            tris.extend(shape);
+        }
+
+        measurements.push(Measurement {
+            contact:  tris,
+            centroid: None,
+            plane:    Plane::default(),
+            offset:   Bounds::Range(-0.25, 0.25),
+            last_vals: (f64::NAN, f64::NAN, f64::NAN),
+            bounding_boxes: bbs,
+            angle_x: Bounds::Range(-0.5, 0.5),
+            angle_y: Bounds::Constant(-across_data[ii - 1] * 0.050),
+        });
+    }
+
+    for ii in 1..=slopes_short.len() {
+        // Short way size is 1005mm
+        //
+        // +--+      +--+
+        // |  |======|  | ----> +x
+        // +--+      +--+
+        // ^  ^x2    ^  ^x4
+        // ^x1       ^x3
+        let x2 = ii as f64 * 40.;
+        let x1 = x2 - 62.01;
+        let x4 = x1 + 273.76;
+        let x3 = x4 - 62.01;
+
+        let origin = dvec2(x1, 0.);
+        let other  = dvec2(x3, 0.);
+
+        let mut tris = Vec::new();
+        let mut bbs = Vec::new();
+        for (_ii, &coord) in [origin, other].iter().enumerate() {
+            let mut coord1 = coord;
+            let mut coord2 = coord + dvec2(62.01, 62.20);
+
+            coord1.x = coord1.x.clamp(0., 1005.);
+            coord1.y = coord1.y.clamp(0., 25.4);
+            coord2.x = coord2.x.clamp(0., 1005.);
+            coord2.y = coord2.y.clamp(0., 25.4);
+
+            let shape = Triangle::rectangle(coord1, coord2);
+
+            // Record the bounding box of the shape
+            let bb = shape.iter().flat_map(|x| x.array()).bounding_box();
+            bbs.push(bb);
+
+            // Record the individual triangles that make up the shape
+            tris.extend(shape);
+        }
+
+        measurements.push(Measurement {
+            contact:  tris,
+            centroid: None,
+            plane:    Plane::default(),
+            offset:   Bounds::Range(-0.25, 0.25),
+            last_vals: (f64::NAN, f64::NAN, f64::NAN),
+            bounding_boxes: bbs,
+            angle_x: Bounds::Constant(slopes_short[ii - 1] * 0.050),
+            angle_y: Bounds::Range(-0.5, 0.5),
+        });
+    }
+
+    for ii in 1..=slopes_long.len() {
+        // Long way size is 1240mm
+        //
+        // +--+      +--+
+        // |  |======|  | ----> +x
+        // +--+      +--+
+        // ^  ^x2    ^  ^x4
+        // ^x1       ^x3
+        let x2 = ii as f64 * 40.;
+        let x1 = x2 - 62.01;
+        let x4 = x1 + 273.76;
+        let x3 = x4 - 62.01;
+
+        let origin = dvec2(x1, 215.);
+        let other  = dvec2(x3, 215.);
+
+        let mut tris = Vec::new();
+        let mut bbs = Vec::new();
+        for (_ii, &coord) in [origin, other].iter().enumerate() {
+            let mut coord1 = coord;
+            let mut coord2 = coord + dvec2(62.01, 62.20);
+
+            coord1.x = coord1.x.clamp(0., 1240.);
+            coord1.y = coord1.y.clamp(215., 215. + 25.4);
+            coord2.x = coord2.x.clamp(0., 1240.);
+            coord2.y = coord2.y.clamp(215., 215. + 25.4);
+
+            let shape = Triangle::rectangle(coord1, coord2);
+
+            // Record the bounding box of the shape
+            let bb = shape.iter().flat_map(|x| x.array()).bounding_box();
+            bbs.push(bb);
+
+            // Record the individual triangles that make up the shape
+            tris.extend(shape);
+        }
+
+        measurements.push(Measurement {
+            contact:  tris,
+            centroid: None,
+            plane:    Plane::default(),
+            offset:   Bounds::Range(-0.25, 0.25),
+            last_vals: (f64::NAN, f64::NAN, f64::NAN),
+            bounding_boxes: bbs,
+            angle_x: Bounds::Constant(slopes_long[ii - 1] * 0.050),
+            angle_y: Bounds::Range(-0.5, 0.5),
+        });
+    }
+}
+
 /// Surface plate measurement strategy
 fn surface_plate(measurements: &mut Vec<Measurement>) {
     let radius = 23.91 / 2.;
@@ -713,8 +892,9 @@ async fn main() {
     let mut measurements: Vec<Measurement> = Vec::new();
 
     // Construct the measurements needed for the surface plate
-    surface_plate(&mut measurements);
-    println!("[{:14.6}] Generated measurements for the surface plate",
+    //surface_plate(&mut measurements);
+    lathe_bed(&mut measurements);
+    println!("[{:14.6}] Generated measurements",
         it.elapsed().as_secs_f64());
 
     struct State {
@@ -748,7 +928,7 @@ async fn main() {
         it.elapsed().as_secs_f64());
 
     // Take random samples of all the surfaces in the measurements
-    let mut samples = Samples::generate(&measurements, 0.1);
+    let mut samples = Samples::generate(&measurements, 0.5);
 
     println!("[{:14.6}] Generated samples",
         it.elapsed().as_secs_f64());
@@ -896,11 +1076,19 @@ async fn main() {
     let mut renderer = Renderer::default();
 
     let it = std::time::Instant::now();
+    let mut should_draw_text = false;
     for frame in 1u64.. {
         use std::fmt::Write;
 
+        // Toggle drawing text
+        if is_key_pressed(KeyCode::T) {
+            should_draw_text = !should_draw_text;
+        }
+
         // Render the best measurements we've had so far
         clear_background(DARKGRAY);
+
+        set_default_camera();
 
         let mut msg = String::new();
         let mut range = (0., 0.);
@@ -921,7 +1109,7 @@ async fn main() {
 
             let camera_angle = (frame as f32 * 1.) % 360.;
             let camera_angle: f32 = 0.;
-            let camera_dist = 600.;
+            let camera_dist = 800.;
 
             // Start at [0, -dist], which is "standing in front of the surface
             // plate"
@@ -940,12 +1128,13 @@ async fn main() {
             // Camera target is the centroid
             let target = vec3(avg.x as f32, avg.y as f32, (avg.z * Z_SCALE) as f32);
 
-            set_camera(&Camera3D {
+            let cam = Camera3D {
                 position: vec3(target.x + camera_x_off, target.y + camera_y_off, target.z + 600.),
                 up: vec3(0., 0., 1.),
                 target,
                 ..Default::default()
-            });
+            };
+            set_camera(&cam);
 
             let (min, max) = samples.draw(&mut renderer, &visited);
 
@@ -954,12 +1143,37 @@ async fn main() {
                 (max - min) * 1e3,
                 iters as f64 / it.elapsed().as_secs_f64()).unwrap();
             range = (min, max - min);
+
+            set_default_camera();
+
+            if should_draw_text {
+                for measurement in &measurements {
+                    for bb in &measurement.bounding_boxes {
+                        let mut pos = dvec3((bb.0.x + bb.1.x) / 2.,
+                            (bb.0.y + bb.1.y) / 2.,
+                            samples.2);
+                        pos.z += measurement.plane.get(pos.xy()).z;
+                        let z = pos.z;
+                        pos.z *= Z_SCALE;
+                        let target = cam.matrix().project_point3(pos.as_vec3());
+
+                        let screen_target = vec2(
+                            (target.x + 1.) / 2. * screen_width(),
+                            screen_height() - (target.y + 1.) / 2. * screen_height(),
+                        );
+
+                        let text = format!("{:.3} um", z * 1e3);
+                        let dims = measure_text(&text, None, 16, 1.0);
+                        draw_text(&text, screen_target.x - dims.width / 2., screen_target.y + dims.height / 2.,
+                            16., ORANGE);
+                    }
+                }
+            }
         }
 
         writeln!(&mut msg,
             "FPS: {}", frame as f64 / it.elapsed().as_secs_f64()).unwrap();
 
-        set_default_camera();
         draw_multiline_text(&msg, 0., 80., 16., Some(1.), BLACK);
 
         let width = screen_width() as usize;
