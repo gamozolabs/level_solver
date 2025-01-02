@@ -4,6 +4,8 @@
 
 mod color;
 
+use std::io::Read;
+use std::fs::File;
 use std::f64::consts::*;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -16,7 +18,7 @@ const SURFACES: usize = 16;
 
 /// Extra Z-scale multiplication for rendering only. This is to visually
 /// amplify the Z axis.
-const Z_SCALE: f64 = 4000.;
+const Z_SCALE: f64 = 2000.;
 
 #[derive(Clone)]
 struct Samples(
@@ -27,9 +29,6 @@ struct Samples(
     /// Lookup from a measurement to samples contained in that measurement.
     /// Indexed by measurement ID
     Vec<Vec<usize>>,
-
-    /// Offset after zero correction
-    f64,
 );
 
 impl Samples {
@@ -91,7 +90,7 @@ impl Samples {
             }
         }
 
-        Self(samples, meas_to_samples, 0.)
+        Self(samples, meas_to_samples)
     }
 
     /// Recompute samples for a given measurement set
@@ -129,24 +128,11 @@ impl Samples {
                 *sum -= min * *n;
             }
         }
-
-        self.2 = -min;
     }
 
     /// Draw the sample points
-    fn draw(&mut self, renderer: &mut Renderer, visited: &BTreeSet<usize>)
-            -> (f64, f64) {
-        // Find the extents of the data
-        let mut min_z = f64::MAX;
-        let mut max_z = f64::MIN;
-        for &(_, _, (s, n)) in self.0.iter() {
-            if n > 0. {
-                let z = s / n;
-                min_z = min_z.min(z);
-                max_z = max_z.max(z);
-            }
-        }
-
+    fn draw(&mut self, renderer: &mut Renderer, visited: &BTreeSet<usize>,
+            min_z: f64, max_z: f64) -> (f64, f64) {
         let range_z = max_z - min_z;
 
         // Display the data as squares at each point
@@ -498,32 +484,12 @@ impl Measurement {
         }
     }
 
-    /// Randomly sample the internal bounds and regenerate the plane
-    fn mutate(&mut self) {
-        // Pick random values for the measurements
-        let mut angle_x = self.angle_x.sample();
-        let mut angle_y = self.angle_y.sample();
-        let mut offset  = self.offset.sample();
-
-        // Move towards the sample
-        let bias = 0.001;
-        for (old, target) in [
-            (self.last_vals.0, &mut angle_x),
-            (self.last_vals.1, &mut angle_y),
-            (self.last_vals.2, &mut offset),
-        ] {
-            if !old.is_nan() {
-                let val = old * (1. - bias) + *target * bias;
-                *target = val;
-            } else {
-                // Take random initial sample. This is mandatory as the angles
-                // may be fixed and thus we must start with them (rather than
-                // zero or something).
-            }
-        }
-
-        // Update the last vals
-        self.last_vals = (angle_x, angle_y, offset);
+    /// Recompute the plane based on the X and Y angles
+    fn recompute(&mut self, xskew: f64, yskew: f64) {
+        // Get the last computed values
+        let (angle_x, angle_y, offset) = self.last_vals;
+        let angle_x = angle_x + xskew;
+        let angle_y = angle_y + yskew;
 
         // Compute the centroid
         let centroid = self.centroid();
@@ -550,9 +516,128 @@ impl Measurement {
             assert!((angle_y - y_reading).abs() < 0.0000001);
         }
     }
+
+    /// Randomly sample the internal bounds and regenerate the plane
+    fn mutate(&mut self) {
+        // Pick random values for the measurements
+        let mut angle_x = self.angle_x.sample();
+        let mut angle_y = self.angle_y.sample();
+        let mut offset  = self.offset.sample();
+
+        // Move towards the sample
+        let bias = 0.001;
+        for (old, target) in [
+            (self.last_vals.0, &mut angle_x),
+            (self.last_vals.1, &mut angle_y),
+            (self.last_vals.2, &mut offset),
+        ] {
+            if !old.is_nan() {
+                let val = old * (1. - bias) + *target * bias;
+                *target = val;
+            } else {
+                // Take random initial sample. This is mandatory as the angles
+                // may be fixed and thus we must start with them (rather than
+                // zero or something).
+            }
+        }
+
+        // Update the last vals
+        self.last_vals = (angle_x, angle_y, offset);
+        self.recompute(0., 0.);
+    }
+}
+
+fn check_angle_mask(val: u32, mask: u32) -> bool {
+    (val & 0xf000000) == mask
+}
+
+fn integer_to_angle(val: u32) -> f64 {
+    const ANGLE_MASK_LOW_BATTERY: u32 = 0x4000000;
+    const ANGLE_MASK_LOW_POWER: u32 = 0xc000000;
+    const ANGLE_MASK_NEGATIVE_OVERRANGE: u32 = 0x9000000;
+    const ANGLE_MASK_POSITIVE_OVERRANGE: u32 = 0x7000000;
+
+    if check_angle_mask(val, ANGLE_MASK_POSITIVE_OVERRANGE) {
+        return f64::MAX;
+    }
+
+    if check_angle_mask(val, ANGLE_MASK_NEGATIVE_OVERRANGE) {
+        return f64::MIN;
+    }
+
+    if check_angle_mask(val, ANGLE_MASK_LOW_BATTERY) || check_angle_mask(val, ANGLE_MASK_LOW_POWER) {
+        return f64::NAN;
+    }
+
+    return (((val & 0xffffffe) << 4) as i32) as f64 / 0x10000000 as f64
 }
 
 fn lathe_bed(measurements: &mut Vec<Measurement>) {
+    let radius = 23.91 / 2.;
+    let inner_radius = radius - 1.9;
+    let sides = 16;
+
+    // Parse the CSV data in order
+    let mut raw_data = Vec::new();
+    for filename in [
+        //"data/lathe_20241227_afterbend/readings.log",
+        //"data/lathe_20241228_scrapetest/level_readings.log",
+        "data/lathe_20250102_stream_readings/level_readings.log",
+    ] {
+        let mut df = File::open(filename).unwrap();
+        let mut chunk = [0u8; 17];
+        while df.read_exact(&mut chunk).is_ok() {
+            let x_raw = u32::from_le_bytes(chunk[8..12].try_into().unwrap());
+            let y_raw = u32::from_le_bytes(chunk[12..16].try_into().unwrap());
+            let trigger = chunk[16] != 0;
+
+            let x_reading =  integer_to_angle(y_raw) * 1e3;
+            let y_reading = -integer_to_angle(x_raw) * 1e3;
+
+            if trigger {
+                raw_data.push((x_reading, y_reading));
+            }
+        }
+    }
+
+    // Compute coords for data points
+    for (ii, &(angle_x, angle_y)) in raw_data.iter().enumerate() {
+        // Get the origin
+        let origin = dvec2(1000., 190.) - dvec2(20. * ii as f64, 0.);
+
+        let x_coord = origin + dvec2(190., 0.);
+        let y_coord = origin - dvec2(0., 190.);
+
+        // Generate ranges for the X and Y slopes
+        let angle_x = Bounds::Constant(angle_x);
+        let angle_y = Bounds::Constant(angle_y);
+
+        let mut tris = Vec::new();
+        let mut bbs = Vec::new();
+        for &coord in &[origin, x_coord, y_coord] {
+            let shape = Triangle::donut(coord, inner_radius, radius, sides);
+
+            // Record the bounding box of the shape
+            let bb = shape.iter().flat_map(|x| x.array()).bounding_box();
+            bbs.push(bb);
+
+            // Record the individual triangles that make up the shape
+            tris.extend(shape);
+        }
+
+        measurements.push(Measurement {
+            contact:  tris,
+            centroid: None,
+            plane:    Plane::default(),
+            offset:   Bounds::Range(-0.25, 0.25),
+            last_vals: (f64::NAN, f64::NAN, f64::NAN),
+            bounding_boxes: bbs,
+            angle_x, angle_y,
+        });
+    }
+}
+
+fn lathe_bed_old(measurements: &mut Vec<Measurement>) {
     // Measuring tool dimensions
     //
     //  62.01mm
@@ -893,22 +978,25 @@ async fn main() {
 
     // Construct the measurements needed for the surface plate
     //surface_plate(&mut measurements);
+    //lathe_bed_old(&mut measurements);
     lathe_bed(&mut measurements);
+
     println!("[{:14.6}] Generated measurements",
         it.elapsed().as_secs_f64());
 
     struct State {
         /// Best planes for measurements we've found so far
-        best_planes: Vec<Plane>,
+        best_planes: Vec<((f64, f64, f64), Plane)>,
 
-        /// Lowest error score
-        best: f64,
+        /// Lowest error score (error, range, xskew, yskew)
+        best: (f64, f64, f64, f64),
 
         /// Number of iterations
         iters: u64,
     }
 
     // Save the current state
+    let mut rng = ::rand::thread_rng();
     let state: [Arc<Mutex<State>>; SURFACES] = std::array::from_fn(|_| {
         Arc::new(Mutex::new(State {
             best_planes: measurements.iter_mut().map(|x| {
@@ -916,9 +1004,9 @@ async fn main() {
                 x.mutate();
 
                 // Return the plane
-                x.plane
-            }).collect::<Vec<Plane>>(),
-            best: f64::MAX,
+                (x.last_vals, x.plane)
+            }).collect::<Vec<_>>(),
+            best: (f64::MAX, f64::MAX, rng.gen_range(-1.0..=1.0), rng.gen_range(-1.0..=1.0)),
             iters: 0,
         }))
     });
@@ -1022,50 +1110,91 @@ async fn main() {
         let selected_samples = selected_samples.clone();
 
         std::thread::spawn(move || {
+            let mut rng = ::rand::thread_rng();
+
             loop {
-                {
+                let (mut xskew, mut yskew) = {
                     let mut state = state.lock().unwrap();
 
                     // Restore best parameters
                     measurements.iter_mut().enumerate()
-                        .for_each(|(ii, x)| x.plane = state.best_planes[ii]);
+                            .for_each(|(ii, x)| {
+                        x.last_vals = state.best_planes[ii].0;
+                        x.plane = state.best_planes[ii].1
+                    });
                     state.iters += 1;
+                    (state.best.2, state.best.3)
+                };
+
+                let mut skew = false;
+                if ::rand::random::<usize>() % 4 == 0 {
+                    // Mutate skews
+                    if ::rand::random::<bool>() {
+                        xskew += rng.gen_range(-0.0001..=0.0001);
+                    } else {
+                        yskew += rng.gen_range(-0.0001..=0.0001);
+                    }
+                    skew = true;
+                } else {
+                    // Randomly mutate some measurements
+                    for _ in 0..::rand::random::<usize>() % 2 + 1 {
+                        let sel = ::rand::random::<usize>() % measurements.len();
+                        measurements[sel].mutate();
+                    }
                 }
 
-                // Randomly mutate some measurements
-                for _ in 0..::rand::random::<usize>() % 2 + 1 {
-                    let sel = ::rand::random::<usize>() % measurements.len();
-                    measurements[sel].mutate();
+                // Recompute all points (skews need this)
+                for meas in measurements.iter_mut() {
+                    meas.recompute(xskew, yskew);
                 }
 
                 // Compute the overlap distances
                 let mut sum_dist = 0.;
                 let mut num_dist = 0.;
+                let mut min_point = f64::MAX;
+                let mut max_point = f64::MIN;
                 for &sample_id in &selected_samples {
                     let &(point, ref deps, _) = &samples.0[sample_id];
                     if !deps.is_empty() {
                         let mut min = f64::MAX;
                         let mut max = f64::MIN;
                         for &dep in deps {
-                            min = min.min(measurements[dep].plane.get(point).z);
-                            max = max.max(measurements[dep].plane.get(point).z);
+                            let m = measurements[dep].plane.get(point);
+                            min = min.min(m.z);
+                            max = max.max(m.z);
                         }
+
+                        min_point = min_point.min(min);
+                        max_point = max_point.max(max);
 
                         sum_dist += (max - min).abs();
                         num_dist += 1.;
                     }
                 }
                 let avg_dist = sum_dist / num_dist;
+                let range = max_point - min_point;
 
                 {
                     let mut state = state.lock().unwrap();
 
-                    if avg_dist < state.best {
+                    if skew && range < state.best.1 {
                         // Save the best planes
                         state.best_planes.iter_mut().enumerate()
-                            .for_each(|(ii, x)| *x = measurements[ii].plane);
+                                .for_each(|(ii, x)| {
+                            *x = (measurements[ii].last_vals, measurements[ii].plane);
+                        });
 
-                        state.best = avg_dist;
+                        state.best = (avg_dist, range, xskew, yskew);
+                    }
+
+                    if (avg_dist, range, xskew, yskew) < state.best {
+                        // Save the best planes
+                        state.best_planes.iter_mut().enumerate()
+                                .for_each(|(ii, x)| {
+                            *x = (measurements[ii].last_vals, measurements[ii].plane);
+                        });
+
+                        state.best = (avg_dist, range, xskew, yskew);
                     }
                 }
             }
@@ -1076,7 +1205,7 @@ async fn main() {
     let mut renderer = Renderer::default();
 
     let it = std::time::Instant::now();
-    let mut should_draw_text = false;
+    let mut should_draw_text = true;
     for frame in 1u64.. {
         use std::fmt::Write;
 
@@ -1091,14 +1220,18 @@ async fn main() {
         set_default_camera();
 
         let mut msg = String::new();
-        let mut range = (0., 0.);
+
+        let mut solutions = Vec::new();
         for state in state.iter() {
             let (score, iters) = {
                 let state = state.lock().unwrap();
 
                 // Restore best parameters
                 measurements.iter_mut().enumerate()
-                    .for_each(|(ii, x)| x.plane = state.best_planes[ii]);
+                        .for_each(|(ii, x)| {
+                    x.last_vals = state.best_planes[ii].0;
+                    x.plane = state.best_planes[ii].1;
+                });
 
                 (state.best, state.iters)
             };
@@ -1107,67 +1240,115 @@ async fn main() {
             samples.recompute(&measurements);
             samples.simplify();
 
-            let camera_angle = (frame as f32 * 1.) % 360.;
-            let camera_angle: f32 = 0.;
-            let camera_dist = 800.;
-
-            // Start at [0, -dist], which is "standing in front of the surface
-            // plate"
-            let camera_x_off = camera_dist * camera_angle.to_radians().sin();
-            let camera_y_off = -camera_dist * camera_angle.to_radians().cos();
-
-            // Average the data
+            // Compute statistics for all points in this set
+            // (min, max, centroid)
+            let mut range = (f64::MAX, f64::MIN);
             let mut sum = dvec3(0., 0., 0.);
-            let mut cnt = 0.;
+            let mut n   = 0.;
             for pt in samples.0.iter().flat_map(|(pt, _, (s, n))| if *n > 0. { Some(pt.extend(s / n)) } else { None }) {
+                range.0 = range.0.min(pt.z);
+                range.1 = range.1.max(pt.z);
                 sum += pt;
-                cnt += 1.;
+                n   += 1.;
             }
-            let avg = sum / cnt;
 
-            // Camera target is the centroid
-            let target = vec3(avg.x as f32, avg.y as f32, (avg.z * Z_SCALE) as f32);
+            // Save solution
+            solutions.push((score, iters, samples.clone(), range, sum, n));
+        }
 
-            let cam = Camera3D {
-                position: vec3(target.x + camera_x_off, target.y + camera_y_off, target.z + 600.),
-                up: vec3(0., 0., 1.),
-                target,
-                ..Default::default()
-            };
-            set_camera(&cam);
+        // Get global minimum and maximum Z values as well as the centroid of
+        // all points
+        let mut range = (f64::MAX, f64::MIN);
+        let mut sum = dvec3(0., 0., 0.);
+        let mut n   = 0.;
+        for (_, _, _, srange, ssum, sn) in solutions.iter_mut() {
+            range.0 = range.0.min(srange.0);
+            range.1 = range.1.max(srange.1);
 
-            let (min, max) = samples.draw(&mut renderer, &visited);
+            sum += *ssum;
+            n   += *sn;
+        }
+        let centroid = sum / n;
 
-            writeln!(&mut msg, "Score {:10.6} um err/point | Range {:7.3} um | Iters {:10.0}/sec",
-                score * 1e3,
-                (max - min) * 1e3,
-                iters as f64 / it.elapsed().as_secs_f64()).unwrap();
-            range = (min, max - min);
+        // Camera target is the centroid
+        let target = (centroid * dvec3(1., 1., Z_SCALE)).as_vec3();
 
-            set_default_camera();
+        let camera_angle = (frame as f32 * 1.) % 360.;
+        let camera_angle: f32 = 0.;
+        let camera_dist = 800.;
 
-            if should_draw_text {
-                for measurement in &measurements {
-                    for bb in &measurement.bounding_boxes {
-                        let mut pos = dvec3((bb.0.x + bb.1.x) / 2.,
-                            (bb.0.y + bb.1.y) / 2.,
-                            samples.2);
-                        pos.z += measurement.plane.get(pos.xy()).z;
-                        let z = pos.z;
-                        pos.z *= Z_SCALE;
-                        let target = cam.matrix().project_point3(pos.as_vec3());
+        // Start at [0, -dist], which is "standing in front of the surface
+        // plate"
+        let camera_x_off = camera_dist * camera_angle.to_radians().sin();
+        let camera_y_off = -camera_dist * camera_angle.to_radians().cos();
 
-                        let screen_target = vec2(
-                            (target.x + 1.) / 2. * screen_width(),
-                            screen_height() - (target.y + 1.) / 2. * screen_height(),
-                        );
+        let cam = Camera3D {
+            position: vec3(target.x + camera_x_off, target.y + camera_y_off, target.z + 600.),
+            up: vec3(0., 0., 1.),
+            target,
+            ..Default::default()
+        };
+        set_camera(&cam);
 
-                        let text = format!("{:.3} um", z * 1e3);
-                        let dims = measure_text(&text, None, 16, 1.0);
-                        draw_text(&text, screen_target.x - dims.width / 2., screen_target.y + dims.height / 2.,
-                            16., ORANGE);
-                    }
+        // Draw all solutions
+        for (score, iters, samples, srange, _, _) in solutions.iter_mut() {
+            samples.draw(&mut renderer, &visited, range.0, range.1);
+            assert!(srange.0 == 0.);
+
+            writeln!(&mut msg, "Score ({:10.6}, {:10.6}, {:10.6}, {:10.6}) um err/point | Range {:7.3} um | Iters {:10.0}/sec",
+                score.0 * 1e3, score.1 * 1e3, score.2, score.3,
+                (srange.1 - srange.0) * 1e3,
+                *iters as f64 / it.elapsed().as_secs_f64()).unwrap();
+        }
+
+        set_default_camera();
+
+        let mut text_to_draw = Vec::new();
+        if should_draw_text {
+            for (_, _, samples, _, _, _) in solutions.iter() {
+                for pos in samples.0.iter().flat_map(|(pt, _, (s, n))| if *n > 0. { Some(pt.extend(s / n)) } else { None }) {
+                    let target = cam.matrix().project_point3(
+                        (pos * dvec3(1., 1., Z_SCALE)).as_vec3());
+
+                    let screen_target = vec2(
+                        (target.x + 1.) / 2. * screen_width(),
+                        screen_height() - (target.y + 1.) / 2. * screen_height(),
+                    );
+
+                    text_to_draw.push(
+                        (pos, screen_target.x, screen_target.y));
                 }
+            }
+        }
+
+        // Reduce the amount of text on screen by picking the average for a
+        // given area
+        let area = 100.;
+        let mut sums = std::collections::BTreeMap::new();
+        for &(pos, x, y) in &text_to_draw {
+            let sx = (pos.x / area).round() as i64;
+            let sy = (pos.y / area).round() as i64;
+            sums.entry((sx, sy))
+                .or_insert_with(Vec::new)
+                .push(dvec3(x as f64, y as f64, pos.z));
+        }
+
+        for (_, values) in sums.iter_mut() {
+            values.sort_by(|a, b| b.z.partial_cmp(&a.z).unwrap());
+
+            for (idx, offset) in [
+                (0, -25.),
+                (values.len() - 1, 25.),
+            ] {
+                let pt = values[idx];
+                let text = format!("{:.3} um", pt.z * 1e3);
+                let dims = measure_text(&text, None, 16, 1.0);
+
+                draw_text(&text,
+                    (pt.x as f32 - dims.width / 2.).round(),
+                    (pt.y as f32 + dims.height / 2. + offset).round(),
+                    16.,
+                    Renderer::color((pt.z - range.0) / (range.1 - range.0)));
             }
         }
 
