@@ -573,9 +573,43 @@ fn integer_to_angle(val: u32) -> f64 {
 }
 
 fn lathe_bed(measurements: &mut Vec<Measurement>) {
-    let radius = 23.91 / 2.;
-    let inner_radius = radius - 1.9;
+    // New casting
+    //
+    //       250mm center to center
+    //       v
+    // +--+          +--+
+    // |o |==========|  | < 49.4mm square feet
+    // +--+          +--+ >>> +x >>>
+    //  ||
+    //  || < 190mm center to center
+    //  ||
+    // +--+ v
+    // |  | v -y
+    // +--+ v
+    //
+    // Lathe layout
+    //
+    // +y
+    // =======================  < 1240mm
+    //   ^
+    //   |
+    //   v 190mm
+    // =================        < 1005mm
+    // (0, 0)             +x
+    //
+    //                 ^
+    //                 ^ measurements are relative to 0,0 for each pad
+    //                 ^ eg. the bottom left of the pad
+    //                 ^
+    //                 ^ measurements start -25mm from the end of the short
+    //                   way (x = 980mm). Step size is 25mm
+    //                   measurements end @ x = -19.4mm
+
+    let radius = 25.;
+    let inner_radius = 0.;
     let sides = 16;
+
+    let foot_square = 49.4;
 
     // Parse the CSV data in order
     let mut raw_data = Vec::new();
@@ -583,7 +617,8 @@ fn lathe_bed(measurements: &mut Vec<Measurement>) {
         //"data/lathe_20241227_afterbend/readings.log",
         //"data/lathe_20241228_scrapetest/level_readings.log",
         //"data/lathe_20250102_stream_readings/level_readings.log",
-        "data/lathe_20250102_stream_readings2/level_readings.log",
+        //"data/lathe_20250102_stream_readings2/level_readings.log",
+        "data/lathe_20250814_custom_casting/level_readings.log",
     ] {
         let mut df = File::open(filename).unwrap();
         let mut chunk = [0u8; 17];
@@ -603,10 +638,12 @@ fn lathe_bed(measurements: &mut Vec<Measurement>) {
 
     // Compute coords for data points
     for (ii, &(angle_x, angle_y)) in raw_data.iter().enumerate() {
-        // Get the origin
-        let origin = dvec2(1000., 190.) - dvec2(20. * ii as f64, 0.);
+        // Get the center of the origin foot
+        let origin = dvec2(1005. + foot_square / 2., 190.) -
+            dvec2(25. * (ii+1) as f64, 0.);
 
-        let x_coord = origin + dvec2(190., 0.);
+        // Get the center coords of the X and Y feet
+        let x_coord = origin + dvec2(250., 0.);
         let y_coord = origin - dvec2(0., 190.);
 
         // Generate ranges for the X and Y slopes
@@ -615,8 +652,30 @@ fn lathe_bed(measurements: &mut Vec<Measurement>) {
 
         let mut tris = Vec::new();
         let mut bbs = Vec::new();
-        for &coord in &[origin, x_coord, y_coord] {
-            let shape = Triangle::donut(coord, inner_radius, radius, sides);
+
+        // Generate squares from the center coords of each pad
+        for (_ii, &coord) in [origin, x_coord, y_coord].iter().enumerate() {
+            let mut c1 = 
+                dvec2(coord.x - foot_square / 2., coord.y - foot_square / 2.);
+            let mut c2 =
+                dvec2(coord.x + foot_square / 2., coord.y + foot_square / 2.);
+
+            if _ii == 0 || _ii == 1 {
+                // Origin and X pad are on the long way
+                c1.x = c1.x.clamp(0., 1240.);
+                c1.y = c1.y.clamp(-12.7 + 190.5, 12.7 + 190.5);
+                c2.x = c2.x.clamp(0., 1240.);
+                c2.y = c2.y.clamp(-12.7 + 190.5, 12.7 + 190.5);
+            } else {
+                // Y pad is on the short way
+                c1.x = c1.x.clamp(0., 1005.);
+                c1.y = c1.y.clamp(-12.7, 12.7);
+                c2.x = c2.x.clamp(0., 1005.);
+                c2.y = c2.y.clamp(-12.7, 12.7);
+            }
+
+            let shape = Triangle::rectangle(c1, c2);
+            println!("{_ii} {c1} {c2}");
 
             // Record the bounding box of the shape
             let bb = shape.iter().flat_map(|x| x.array()).bounding_box();
@@ -1127,7 +1186,7 @@ async fn main() {
                     (state.best.2, state.best.3)
                 };
 
-                let mut skew = false;
+                let mut skew = true;
                 if ::rand::random::<usize>() % 4 == 0 {
                     // Mutate skews
                     if ::rand::random::<bool>() {
