@@ -582,7 +582,8 @@ fn lathe_bed(measurements: &mut Vec<Measurement>) {
     for filename in [
         //"data/lathe_20241227_afterbend/readings.log",
         //"data/lathe_20241228_scrapetest/level_readings.log",
-        "data/lathe_20250102_stream_readings/level_readings.log",
+        //"data/lathe_20250102_stream_readings/level_readings.log",
+        "data/lathe_20250102_stream_readings2/level_readings.log",
     ] {
         let mut df = File::open(filename).unwrap();
         let mut chunk = [0u8; 17];
