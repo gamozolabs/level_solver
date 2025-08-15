@@ -14,7 +14,7 @@ use ::rand::prelude::*;
 use macroquad::prelude::*;
 
 /// Number of surfaces to create (also number of threads)
-const SURFACES: usize = 16;
+const SURFACES: usize = 3;
 
 /// Extra Z-scale multiplication for rendering only. This is to visually
 /// amplify the Z axis.
@@ -1366,7 +1366,9 @@ async fn main() {
             assert!(srange.0 == 0.);
 
             writeln!(&mut msg, "Score ({:10.6}, {:10.6}, {:10.6}, {:10.6}) um err/point | Range {:7.3} um | Iters {:10.0}/sec",
-                score.0 * 1e3, score.1 * 1e3, score.2, score.3,
+                score.0 * 1e3, score.1 * 1e3,
+                score.3, -score.2, // Intentionally flip the X and Y axis, since that's what we did
+                                  // with the raw input measurements
                 (srange.1 - srange.0) * 1e3,
                 *iters as f64 / it.elapsed().as_secs_f64()).unwrap();
         }
