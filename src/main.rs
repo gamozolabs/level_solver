@@ -627,10 +627,14 @@ fn lathe_bed(measurements: &mut Vec<Measurement>) {
             let y_raw = u32::from_le_bytes(chunk[12..16].try_into().unwrap());
             let trigger = chunk[16] != 0;
 
-            let x_reading =  integer_to_angle(y_raw) * 1e3;
-            let y_reading = -integer_to_angle(x_raw) * 1e3;
+            let x_raw = integer_to_angle(x_raw) * 1e3;
+            let y_raw = integer_to_angle(y_raw) * 1e3;
+
+            let x_reading =  y_raw;
+            let y_reading = -x_raw;
 
             if trigger {
+                println!("Raw X {x_raw:8.3} mm/min | Raw Y {y_raw:8.3} mm/min");
                 raw_data.push((x_reading, y_reading));
             }
         }
@@ -675,7 +679,6 @@ fn lathe_bed(measurements: &mut Vec<Measurement>) {
             }
 
             let shape = Triangle::rectangle(c1, c2);
-            println!("{_ii} {c1} {c2}");
 
             // Record the bounding box of the shape
             let bb = shape.iter().flat_map(|x| x.array()).bounding_box();
@@ -1233,6 +1236,13 @@ async fn main() {
                 }
                 let avg_dist = sum_dist / num_dist;
                 let range = max_point - min_point;
+
+                // Recompute all points to display the _original_ level
+                // readings!
+                //
+                // This is for viewing if the lathe bed is out of level and
+                // needs to be re-leveled
+                //for meas in measurements.iter_mut() { meas.recompute(0., 0.); }
 
                 {
                     let mut state = state.lock().unwrap();
