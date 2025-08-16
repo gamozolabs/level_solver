@@ -1049,9 +1049,9 @@ fn window_conf() -> Conf {
     Conf {
         window_title: "Window name".to_owned(),
         sample_count: 8, // MSAA
-        fullscreen: true,
-        window_width: 1920,
-        window_height: 1080,
+        fullscreen: false,
+        window_width: 1440,
+        window_height: 900,
         ..Default::default()
     }
 }
