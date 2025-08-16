@@ -29,6 +29,9 @@ struct Samples(
     /// Lookup from a measurement to samples contained in that measurement.
     /// Indexed by measurement ID
     Vec<Vec<usize>>,
+
+    /// Z adjustment
+    f64,
 );
 
 impl Samples {
@@ -90,7 +93,7 @@ impl Samples {
             }
         }
 
-        Self(samples, meas_to_samples)
+        Self(samples, meas_to_samples, 0.)
     }
 
     /// Recompute samples for a given measurement set
@@ -122,10 +125,13 @@ impl Samples {
             }
         }
 
+        // Save adjustment
+        self.2 = -min;
+
         // Adjust all data to zero
         for (_, _, (sum, n)) in self.0.iter_mut() {
             if *n > 0. {
-                *sum -= min * *n;
+                *sum += self.2 * *n;
             }
         }
     }
@@ -420,6 +426,12 @@ struct Measurement {
     /// checking triangles.
     bounding_boxes: Vec<(DVec2, DVec2)>,
 
+    /// Bounding boxes of the level feet. This is without bounding it to the
+    /// surface being measured. This allows us to display where the contact
+    /// surfaces of the level are, even if they may be off the surface being
+    /// measured
+    raw_bounding_boxes: Vec<(DVec2, DVec2)>,
+
     /// Centroid for the contact patch. This is considered the origin for the
     /// `plane`
     centroid: Option<DVec2>,
@@ -605,10 +617,6 @@ fn lathe_bed(measurements: &mut Vec<Measurement>) {
     //                   way (x = 980mm). Step size is 25mm
     //                   measurements end @ x = -19.4mm
 
-    let radius = 25.;
-    let inner_radius = 0.;
-    let sides = 16;
-
     let foot_square = 49.4;
 
     // Parse the CSV data in order
@@ -634,10 +642,14 @@ fn lathe_bed(measurements: &mut Vec<Measurement>) {
             let y_reading = -x_raw;
 
             if trigger {
-                println!("Raw X {x_raw:8.3} mm/min | Raw Y {y_raw:8.3} mm/min");
+                println!("M{:03} | Raw X {x_raw:8.3} mm/m | \
+                    Raw Y {y_raw:8.3} mm/m",
+                    raw_data.len() + 1);
                 raw_data.push((x_reading, y_reading));
             }
         }
+
+        println!("Total measurements {}", raw_data.len());
     }
 
     // Compute coords for data points
@@ -656,6 +668,7 @@ fn lathe_bed(measurements: &mut Vec<Measurement>) {
 
         let mut tris = Vec::new();
         let mut bbs = Vec::new();
+        let mut raw_bbs = Vec::new();
 
         // Generate squares from the center coords of each pad
         for (_ii, &coord) in [origin, x_coord, y_coord].iter().enumerate() {
@@ -664,6 +677,13 @@ fn lathe_bed(measurements: &mut Vec<Measurement>) {
             let mut c2 =
                 dvec2(coord.x + foot_square / 2., coord.y + foot_square / 2.);
 
+            // Record the raw bounding box of the shape
+            let raw_shape = Triangle::rectangle(c1, c2);
+            let raw_bb = raw_shape.iter()
+                .flat_map(|x| x.array()).bounding_box();
+            raw_bbs.push(raw_bb);
+
+            // Clamp the level contact points to the surface being measured
             if _ii == 0 || _ii == 1 {
                 // Origin and X pad are on the long way
                 c1.x = c1.x.clamp(0., 1240.);
@@ -695,11 +715,13 @@ fn lathe_bed(measurements: &mut Vec<Measurement>) {
             offset:   Bounds::Range(-0.25, 0.25),
             last_vals: (f64::NAN, f64::NAN, f64::NAN),
             bounding_boxes: bbs,
+            raw_bounding_boxes: raw_bbs,
             angle_x, angle_y,
         });
     }
 }
 
+/*
 fn lathe_bed_old(measurements: &mut Vec<Measurement>) {
     // Measuring tool dimensions
     //
@@ -872,8 +894,9 @@ fn lathe_bed_old(measurements: &mut Vec<Measurement>) {
             angle_y: Bounds::Range(-0.5, 0.5),
         });
     }
-}
+}*/
 
+/*
 /// Surface plate measurement strategy
 fn surface_plate(measurements: &mut Vec<Measurement>) {
     let radius = 23.91 / 2.;
@@ -1019,7 +1042,7 @@ fn surface_plate(measurements: &mut Vec<Measurement>) {
             }
         }
     }
-}
+}*/
 
 /// Construct window configuration
 fn window_conf() -> Conf {
@@ -1079,7 +1102,12 @@ async fn main() {
         it.elapsed().as_secs_f64());
 
     // Take random samples of all the surfaces in the measurements
-    let mut samples = Samples::generate(&measurements, 0.5);
+    // This is what we use to sample for minimization
+    let samples = Samples::generate(&measurements, 0.1);
+
+    // This is the set we use for rendering, it's a smaller set for faster
+    // drawing
+    let mut samples_render = Samples::generate(&measurements, 1.);
 
     println!("[{:14.6}] Generated samples",
         it.elapsed().as_secs_f64());
@@ -1271,17 +1299,25 @@ async fn main() {
         });
     }
 
+    println!("[{:14.6}] Starting rendering process",
+        it.elapsed().as_secs_f64());
+
     // Create renderer
     let mut renderer = Renderer::default();
 
-    let it = std::time::Instant::now();
     let mut should_draw_text = true;
+    let mut should_draw_feet = true;
+    let mut solutions = Vec::new();
+    let it = Instant::now();
     for frame in 1u64.. {
         use std::fmt::Write;
 
         // Toggle drawing text
         if is_key_pressed(KeyCode::T) {
             should_draw_text = !should_draw_text;
+        }
+        if is_key_pressed(KeyCode::F) {
+            should_draw_feet = !should_draw_feet;
         }
 
         // Render the best measurements we've had so far
@@ -1291,7 +1327,7 @@ async fn main() {
 
         let mut msg = String::new();
 
-        let mut solutions = Vec::new();
+        solutions.clear();
         for state in state.iter() {
             let (score, iters) = {
                 let state = state.lock().unwrap();
@@ -1307,15 +1343,15 @@ async fn main() {
             };
 
             // Update samples
-            samples.recompute(&measurements);
-            samples.simplify();
+            samples_render.recompute(&measurements);
+            samples_render.simplify();
 
             // Compute statistics for all points in this set
             // (min, max, centroid)
             let mut range = (f64::MAX, f64::MIN);
             let mut sum = dvec3(0., 0., 0.);
             let mut n   = 0.;
-            for pt in samples.0.iter().flat_map(|(pt, _, (s, n))| if *n > 0. { Some(pt.extend(s / n)) } else { None }) {
+            for pt in samples_render.0.iter().flat_map(|(pt, _, (s, n))| if *n > 0. { Some(pt.extend(s / n)) } else { None }) {
                 range.0 = range.0.min(pt.z);
                 range.1 = range.1.max(pt.z);
                 sum += pt;
@@ -1323,7 +1359,7 @@ async fn main() {
             }
 
             // Save solution
-            solutions.push((score, iters, samples.clone(), range, sum, n));
+            solutions.push((score, iters, samples_render.clone(), range, sum, n));
         }
 
         // Get global minimum and maximum Z values as well as the centroid of
@@ -1361,24 +1397,76 @@ async fn main() {
         set_camera(&cam);
 
         // Draw all solutions
-        for (score, iters, samples, srange, _, _) in solutions.iter_mut() {
-            samples.draw(&mut renderer, &visited, range.0, range.1);
-            assert!(srange.0 == 0.);
+        for (score, iters, samples_render, _, _, _) in solutions.iter_mut() {
+            samples_render.draw(&mut renderer, &visited, range.0, range.1);
 
-            writeln!(&mut msg, "Score ({:10.6}, {:10.6}, {:10.6}, {:10.6}) um err/point | Range {:7.3} um | Iters {:10.0}/sec",
+            writeln!(&mut msg, "Score ({:10.6}, {:10.6}, {:10.6}, {:10.6}) um err/point | Iters {:10.0}/sec | Samples {}",
                 score.0 * 1e3, score.1 * 1e3,
                 score.3, -score.2, // Intentionally flip the X and Y axis, since that's what we did
                                   // with the raw input measurements
-                (srange.1 - srange.0) * 1e3,
-                *iters as f64 / it.elapsed().as_secs_f64()).unwrap();
+                *iters as f64 / it.elapsed().as_secs_f64(),
+                samples_render.0.len()).unwrap();
+        }
+
+        // Draw all measurement bounding boxes
+        let mut bb_labels = Vec::new();
+        if should_draw_feet {
+            for (ii, meas) in measurements.iter().enumerate() {
+                for bb in &meas.raw_bounding_boxes {
+                    // Get the bottom left and top right coordinates
+                    let bl = bb.0;
+                    let tr = bb.1;
+
+                    //    +----+ tr
+                    //    |    |
+                    //    |    |
+                    // bl +----+
+
+                    let color = if ii & 1 == 0 { BLACK } else { WHITE };
+
+                    let mut avg = dvec3(0., 0., 0.);
+                    for (a, b) in [
+                        (dvec2(bl.x, bl.y), dvec2(tr.x, bl.y)),
+                        (dvec2(tr.x, bl.y), dvec2(tr.x, tr.y)),
+                        (dvec2(tr.x, tr.y), dvec2(bl.x, tr.y)),
+                        (dvec2(bl.x, tr.y), dvec2(bl.x, bl.y)),
+                    ] {
+                        // Get the Z positions of the level contact feet
+                        let a = (meas.plane.get(a) +
+                            dvec3(0., 0., samples_render.2)) *
+                            dvec3(1., 1., Z_SCALE);
+                        let b = (meas.plane.get(b) +
+                            dvec3(0., 0., samples_render.2)) *
+                            dvec3(1., 1., Z_SCALE);
+
+                        avg += a;
+                        avg += b;
+
+                        draw_line_3d(a.as_vec3(), b.as_vec3(), color);
+                    }
+
+                    // Compute centroid for the bounding box
+                    let centroid = avg / 8.;
+
+                    let target = cam.matrix().project_point3(
+                        centroid.as_vec3());
+
+                    let screen_target = vec2(
+                        (target.x + 1.) / 2. * screen_width(),
+                        screen_height() - (target.y + 1.) / 2. * screen_height(),
+                    );
+
+                    bb_labels.push((format!("M{:03}", ii + 1), screen_target, color));
+                }
+            }
         }
 
         set_default_camera();
 
         let mut text_to_draw = Vec::new();
         if should_draw_text {
-            for (_, _, samples, _, _, _) in solutions.iter() {
-                for pos in samples.0.iter().flat_map(|(pt, _, (s, n))| if *n > 0. { Some(pt.extend(s / n)) } else { None }) {
+            for (_, _, samples_render, _, _, _) in solutions.iter() {
+                for pos in samples_render.0.iter().flat_map(|(pt, _, (s, n))| if *n > 0. { Some(pt.extend(s / n)) } else { None }) {
                     let target = cam.matrix().project_point3(
                         (pos * dvec3(1., 1., Z_SCALE)).as_vec3());
 
@@ -1391,6 +1479,32 @@ async fn main() {
                         (pos, screen_target.x, screen_target.y));
                 }
             }
+        }
+
+        if should_draw_feet {
+            for (text, pos, col) in bb_labels {
+                draw_text(&text, pos.x, pos.y, 16., col);
+            }
+        }
+
+        for (ii, meas) in measurements.iter().enumerate() {
+            // 1-indexed measurement ID
+            let mid = ii + 1;
+            let color = if ii & 1 == 0 { BLACK } else { WHITE };
+
+            let x = ((ii / 16) as f32) * 400. + 2.;
+            let y = ((ii % 16) as f32) * 16.  + screen_height() - 256.;
+
+            // Flip angles since we use a weird coord system
+            let Bounds::Constant(angle_x) = meas.angle_y else { panic!() };
+            let Bounds::Constant(angle_y) = meas.angle_x else { panic!() };
+            let angle_x = -angle_x;
+
+            let (score, _, _, _, _, _) = solutions.last().unwrap();
+            let simx = angle_x - score.3;
+            let simy = angle_y - -score.2;
+
+            draw_text(&format!("M{mid:03} {angle_x:6.3} {angle_y:6.3} -> {simx:6.3} {simy:6.3}"), x, y, 16., color);
         }
 
         // Reduce the amount of text on screen by picking the average for a
@@ -1444,8 +1558,6 @@ async fn main() {
 
         let image = get_screen_data();
         image.export_png("screenshot.png");
-        println!("[{:14.6}] Drew image for frame {}",
-            it.elapsed().as_secs_f64(), frame);
 
         next_frame().await;
     }
